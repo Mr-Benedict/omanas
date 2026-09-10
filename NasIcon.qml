@@ -1,9 +1,18 @@
 import QtQuick
+import QtQuick.Shapes
 import qs.Commons
 
-// A NAS chassis drawn rather than shipped as an SVG: two drive bays and a
-// status light. Drawing it keeps it crisp at bar sizes and lets the status
-// light carry colour while the body follows the theme.
+// A two-bay desktop NAS, drawn rather than shipped as an asset.
+//
+// Deliberately not Synology's own mark: theirs is the DSM wordmark, which is
+// an unreadable smudge by the time it is 13px tall in the bar, and shipping
+// a trademarked logo with a plugin anyone can redistribute is not a licence
+// this project has. A device silhouette carries neither problem.
+//
+// Solid with cut-out bays, because at bar size an outline of this shape
+// collapses into a grey blob while a solid one keeps its edges. The cut-outs
+// are real holes -- an odd-even fill rather than slots painted in a
+// background colour -- so the icon sits correctly on the bar and on a panel.
 Item {
   id: root
 
@@ -15,56 +24,65 @@ Item {
   implicitWidth: iconSize
   implicitHeight: iconSize
 
-  readonly property color lightColor: {
+  // State is carried by the whole silhouette rather than a status dot. A dot
+  // would be about two pixels in the bar, too small to read and too small to
+  // colour convincingly.
+  readonly property color tint: {
     if (health === "critical") return Color.urgent
-    if (health === "warning") return Qt.lighter(Color.urgent, 1.35)
-    if (health === "ok") return Color.accent
-    return Qt.darker(root.color, 1.8)
+    if (health === "warning") return Qt.lighter(Color.urgent, 1.3)
+    if (health === "offline") return Qt.darker(root.color, 1.6)
+    return root.color
   }
 
-  Rectangle {
-    id: chassis
-    anchors.centerIn: parent
-    width: root.iconSize * 0.82
-    height: root.iconSize * 0.94
-    radius: Math.max(1, root.iconSize * 0.1)
-    color: "transparent"
-    border.color: root.color
-    border.width: Math.max(1, root.iconSize * 0.075)
+  // Geometry is rounded to whole pixels so the bays stay crisp instead of
+  // landing on half a pixel and blurring at the size that matters most.
+  readonly property real _w: Math.round(iconSize * 0.72)
+  readonly property real _h: Math.round(iconSize * 0.94)
+  readonly property real _x: Math.round((iconSize - _w) / 2)
+  readonly property real _y: Math.round((iconSize - _h) / 2)
+  readonly property real _r: Math.max(1, Math.round(iconSize * 0.13))
+  readonly property real _bayW: Math.max(1, Math.round(iconSize * 0.12))
+  readonly property real _bayH: Math.round(_h * 0.56)
+  readonly property real _bayY: _y + Math.round((_h - _bayH) / 2)
+  readonly property real _bay1: _x + Math.round(_w * 0.22)
+  readonly property real _bay2: _x + _w - Math.round(_w * 0.22) - _bayW
 
-    Column {
-      anchors.centerIn: parent
-      spacing: chassis.height * 0.12
+  function _roundedBody() {
+    var x = _x, y = _y, w = _w, h = _h, r = _r
+    return "M " + (x + r) + " " + y
+         + " H " + (x + w - r)
+         + " A " + r + " " + r + " 0 0 1 " + (x + w) + " " + (y + r)
+         + " V " + (y + h - r)
+         + " A " + r + " " + r + " 0 0 1 " + (x + w - r) + " " + (y + h)
+         + " H " + (x + r)
+         + " A " + r + " " + r + " 0 0 1 " + x + " " + (y + h - r)
+         + " V " + (y + r)
+         + " A " + r + " " + r + " 0 0 1 " + (x + r) + " " + y + " Z"
+  }
 
-      Repeater {
-        model: 2
-        Rectangle {
-          width: chassis.width * 0.52
-          height: chassis.height * 0.17
-          radius: height / 2
-          color: root.color
-          opacity: 0.85
-        }
-      }
+  function _bay(bx) {
+    return " M " + bx + " " + _bayY
+         + " h " + _bayW + " v " + _bayH + " h " + (-_bayW) + " Z"
+  }
+
+  Shape {
+    anchors.fill: parent
+    preferredRendererType: Shape.CurveRenderer
+
+    ShapePath {
+      fillRule: ShapePath.OddEvenFill
+      fillColor: root.tint
+      strokeWidth: 0
+      strokeColor: "transparent"
+      PathSvg { path: root._roundedBody() + root._bay(root._bay1) + root._bay(root._bay2) }
     }
+  }
 
-    Rectangle {
-      width: chassis.width * 0.16
-      height: width
-      radius: width / 2
-      color: root.lightColor
-      anchors.right: parent.right
-      anchors.bottom: parent.bottom
-      anchors.rightMargin: chassis.width * 0.14
-      anchors.bottomMargin: chassis.height * 0.13
-
-      // A failing NAS should catch the eye without being noisy about it.
-      SequentialAnimation on opacity {
-        running: root.health === "critical"
-        loops: Animation.Infinite
-        NumberAnimation { to: 0.25; duration: 900; easing.type: Easing.InOutQuad }
-        NumberAnimation { to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
-      }
-    }
+  // A NAS in trouble should catch the eye without being noisy about it.
+  SequentialAnimation on opacity {
+    running: root.health === "critical"
+    loops: Animation.Infinite
+    NumberAnimation { to: 0.35; duration: 900; easing.type: Easing.InOutQuad }
+    NumberAnimation { to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
   }
 }

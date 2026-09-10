@@ -135,8 +135,8 @@ Panel {
       Item {
         NasIcon {
           anchors.centerIn: parent
-          iconSize: Style.space(13)
-          color: root.barIconColor
+          iconSize: Style.space(14)
+          color: root.barForeground
           health: root.barHealth
         }
       }
