@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Omanas — Synology DSM client for the Omarchy bar plugin.
+
+The QML side never speaks to the NAS and never holds a credential. It runs
+this helper and reads JSON off stdout. That split is deliberate: Omarchy's
+shell hosts every third-party plugin in one QML scene that plugins can walk,
+so a password or session id living in a QML property would be reachable by
+any other installed plugin. Here it is confined to a short-lived process.
+
+Standard library only, so the plugin installs by cloning and nothing else.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_DIR = os.path.expanduser("~/.config/omanas")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+CACHE_DIR = os.path.expanduser("~/.cache/omanas")
+SESSION_PATH = os.path.join(CACHE_DIR, "session.json")
+
+KEYRING_SERVICE = "omanas"
+SESSION_NAME = "Omanas"
+
+# DSM error codes worth translating. Everything else surfaces as its number,
+# because DSM's own catalogue is inconsistent between APIs.
+AUTH_ERRORS = {
+    400: "Wrong username or password",
+    401: "Account disabled",
+    402: "Permission denied",
+    403: "Two-factor code required",
+    404: "Two-factor code is wrong",
+    406: "Two-factor is enforced for this account",
+    407: "Blocked by IP auto-block",
+    408: "Password expired and must be changed in DSM",
+    409: "Password expired",
+    410: "Password must be changed",
+    411: "Account locked",
+}
+COMMON_ERRORS = {
+    100: "Unknown error",
+    101: "Invalid parameter",
+    102: "The requested API does not exist",
+    103: "The requested method does not exist",
+    104: "This API version is not supported",
+    105: "Insufficient user privilege",
+    106: "Session timeout",
+    107: "Session interrupted by a duplicate login",
+    119: "Session expired",
+}
+
+
+class DsmError(Exception):
+    """A DSM API call came back with success=false."""
+
+    def __init__(self, code: int, api: str = "", method: str = ""):
+        self.code = int(code)
+        self.api = api
+        self.method = method
+        super().__init__(self.describe())
+
+    def describe(self) -> str:
+        text = AUTH_ERRORS.get(self.code) or COMMON_ERRORS.get(self.code)
+        where = f" ({self.api}.{self.method})" if self.api else ""
+        return f"{text}{where}" if text else f"DSM error {self.code}{where}"
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Cannot read {CONFIG_PATH}: {exc}")
+
+
+def save_config(config: dict) -> None:
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_PATH)
+
+
+# --------------------------------------------------------------- secrets
+#
+# secret-tool rather than a Python binding, so the helper keeps its
+# no-dependency promise. Secrets cross as stdin/stdout between two local
+# processes and never appear in argv, where any user on the box could read
+# them out of /proc.
+
+
+def secret_attrs(config: dict, kind: str) -> list[str]:
+    return [
+        "service", KEYRING_SERVICE,
+        "host", str(config.get("host", "")),
+        "account", str(config.get("username", "")),
+        "kind", kind,
+    ]
+
+
+def secret_store(config: dict, kind: str, value: str, label: str) -> None:
+    subprocess.run(
+        ["secret-tool", "store", "--label", label, *secret_attrs(config, kind)],
+        input=value,
+        text=True,
+        check=True,
+    )
+
+
+def secret_lookup(config: dict, kind: str) -> str | None:
+    result = subprocess.run(
+        ["secret-tool", "lookup", *secret_attrs(config, kind)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout or None
+
+
+def secret_clear(config: dict, kind: str) -> None:
+    subprocess.run(
+        ["secret-tool", "clear", *secret_attrs(config, kind)],
+        capture_output=True,
+        text=True,
+    )
+
+
+# ------------------------------------------------------------------- TLS
+
+
+class PinnedContext:
+    """TLS for a NAS that almost certainly has a self-signed certificate.
+
+    Turning verification off wholesale is the usual advice and it is wrong:
+    it accepts any certificate forever. Instead the first connection records
+    the certificate fingerprint and every later one must match it, so a swap
+    is visible. The user is trusting one specific certificate rather than
+    trusting nothing.
+    """
+
+    def __init__(self, config: dict):
+        self.pin = config.get("certFingerprint")
+        self.verify = bool(config.get("verifyTls", True))
+
+    def build(self) -> ssl.SSLContext:
+        ctx = ssl.create_default_context()
+        if not self.verify or self.pin:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    @staticmethod
+    def fingerprint(host: str, port: int) -> str:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        import socket
+
+        with socket.create_connection((host, port), timeout=10) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as sock:
+                der = sock.getpeercert(binary_form=True)
+        return hashlib.sha256(der).hexdigest()
+
+
+# ------------------------------------------------------------------ DSM
+
+
+class Dsm:
+    def __init__(self, config: dict, timeout: float = 20.0):
+        self.config = config
+        self.host = config.get("host") or ""
+        self.port = int(config.get("port") or (5001 if config.get("https", True) else 5000))
+        self.https = bool(config.get("https", True))
+        self.username = config.get("username") or ""
+        self.timeout = timeout
+        self.sid: str | None = None
+        self.apis: dict[str, dict] = {}
+        self._ctx = PinnedContext(config).build()
+        if not self.host:
+            raise SystemExit("No NAS configured. Run: omanas configure --host ... --user ...")
+
+    @property
+    def base(self) -> str:
+        scheme = "https" if self.https else "http"
+        return f"{scheme}://{self.host}:{self.port}"
+
+    def _open(self, url: str, data: bytes | None = None) -> dict:
+        request = urllib.request.Request(url, data=data)
+        request.add_header("User-Agent", "Omanas/0.1 (+https://github.com/Mr-Benedict/omanas)")
+        if data is not None:
+            request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self._ctx) as response:
+                payload = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise SystemExit(f"HTTP {exc.code} from {self.host}")
+        except urllib.error.URLError as exc:
+            raise SystemExit(f"Cannot reach {self.host}:{self.port} — {exc.reason}")
+        try:
+            return json.loads(payload)
+        except ValueError:
+            raise SystemExit(f"{self.host} did not return JSON (is the port right?)")
+
+    def discover(self) -> dict[str, dict]:
+        """Ask DSM which APIs exist, rather than hardcoding paths.
+
+        Paths and version ranges move between DSM releases; SYNO.API.Info is
+        the one stable way to find out what this particular NAS offers.
+        """
+        if self.apis:
+            return self.apis
+        query = urllib.parse.urlencode(
+            {"api": "SYNO.API.Info", "version": "1", "method": "query", "query": "all"}
+        )
+        body = self._open(f"{self.base}/webapi/query.cgi?{query}")
+        if not body.get("success"):
+            raise DsmError(body.get("error", {}).get("code", 0), "SYNO.API.Info", "query")
+        self.apis = body.get("data") or {}
+        return self.apis
+
+    def entry(self, api: str) -> tuple[str, int]:
+        """Resolve an API name to its CGI path and a usable version."""
+        info = self.discover().get(api)
+        if not info:
+            raise DsmError(102, api, "")
+        return str(info.get("path", "entry.cgi")), int(info.get("maxVersion", 1))
+
+    def call(
+        self,
+        api: str,
+        method: str,
+        version: int | None = None,
+        params: dict | None = None,
+        post: bool = False,
+    ) -> dict:
+        path, max_version = self.entry(api)
+        fields = {
+            "api": api,
+            "method": method,
+            "version": str(version if version is not None else max_version),
+        }
+        fields.update({k: str(v) for k, v in (params or {}).items()})
+        if self.sid:
+            fields["_sid"] = self.sid
+        url = f"{self.base}/webapi/{path}"
+        if post:
+            body = self._open(url, urllib.parse.urlencode(fields).encode())
+        else:
+            body = self._open(f"{url}?{urllib.parse.urlencode(fields)}")
+        if not body.get("success"):
+            raise DsmError(body.get("error", {}).get("code", 0), api, method)
+        return body.get("data") or {}
+
+    # -- session ---------------------------------------------------------
+
+    def load_session(self) -> bool:
+        try:
+            with open(SESSION_PATH, encoding="utf-8") as handle:
+                cached = json.load(handle)
+        except (OSError, ValueError):
+            return False
+        if cached.get("host") != self.host or cached.get("account") != self.username:
+            return False
+        if float(cached.get("expires", 0)) < time.time():
+            return False
+        self.sid = cached.get("sid")
+        return bool(self.sid)
+
+    def save_session(self) -> None:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        tmp = SESSION_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "host": self.host,
+                    "account": self.username,
+                    "sid": self.sid,
+                    # DSM's own default session lifetime is longer, but a
+                    # short local expiry costs one cheap re-login and keeps a
+                    # stale sid from silently failing every later call.
+                    "expires": time.time() + 3600,
+                },
+                handle,
+            )
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SESSION_PATH)
+
+    def login(self, otp: str | None = None, force: bool = False) -> dict:
+        if not force and self.load_session():
+            return {"reused": True}
+        password = secret_lookup(self.config, "password")
+        if not password:
+            raise SystemExit("No password in the keyring. Run: omanas configure ...")
+        params = {
+            "account": self.username,
+            "passwd": password,
+            "session": SESSION_NAME,
+            "format": "sid",
+            # Ask DSM to hand back a device token so a two-factor account
+            # does not demand a fresh code on every login from this machine.
+            "enable_device_token": "yes",
+        }
+        if otp:
+            params["otp_code"] = otp
+        device_id = secret_lookup(self.config, "device_id")
+        if device_id and not otp:
+            params["device_id"] = device_id
+        # POST so the password never lands in a query string, where DSM's
+        # own access log would keep it.
+        data = self.call("SYNO.API.Auth", "login", params=params, post=True)
+        self.sid = data.get("sid")
+        if data.get("did") or data.get("device_id"):
+            secret_store(
+                self.config,
+                "device_id",
+                str(data.get("did") or data.get("device_id")),
+                f"Omanas device token ({self.host})",
+            )
+        self.save_session()
+        return {"reused": False}
+
+    def logout(self) -> None:
+        if self.sid:
+            try:
+                self.call("SYNO.API.Auth", "logout", params={"session": SESSION_NAME})
+            except (DsmError, SystemExit):
+                pass
+        try:
+            os.remove(SESSION_PATH)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------ redaction
+#
+# Probe output is meant to be pasted into a bug report or a chat, so it
+# describes shapes rather than values: which keys exist and what type each
+# holds. Serial numbers, share names and volume paths stay on the NAS.
+# Numbers survive verbatim — they say whether a field is bytes, kilobytes or
+# a percentage, which is the whole reason to look, and they identify nobody.
+
+# ------------------------------------------------------------- commands
+#
+# Endpoints the panel wants. The first four are well mapped by existing open
+# source clients; the last two are the reason `probe` exists, since no public
+# source pins down which one a given DSM actually serves.
+WANTED = [
+    ("system", ["SYNO.Core.System"]),
+    ("utilisation", ["SYNO.Core.System.Utilization"]),
+    ("storage", ["SYNO.Core.Storage.Volume", "SYNO.Storage.CGI.Storage"]),
+    ("shares", ["SYNO.Core.Share"]),
+    ("encrypted shares", [
+        "SYNO.Core.Share.Crypto",
+        "SYNO.Core.Share.Crypto.KeyManager.Store",
+        "SYNO.Core.Share.KeyManager.Store",
+        "SYNO.Core.Share.KeyManager.AutoKey",
+    ]),
+    ("logs", [
+        "SYNO.Core.SystemLog",
+        "SYNO.Core.Log",
+        "SYNO.Core.SyslogClient.Log",
+        "SYNO.Core.SyslogClient.Status",
+        "SYNO.LogCenter.Log",
+    ]),
+]
+
+# Read-only calls probe may make. Nothing here changes NAS state.
+PROBE_CALLS = [
+    ("SYNO.Core.System", "info", None, {}),
+    ("SYNO.Core.System.Utilization", "get", None, {}),
+    ("SYNO.Storage.CGI.Storage", "load_info", None, {}),
+    ("SYNO.Core.Share", "list", None, {
+        "additional": '["hidden","encryption","share_quota","recyclebin"]',
+        "shareType": "all",
+    }),
+    ("SYNO.Core.Share.Crypto", "list", None, {}),
+    ("SYNO.Core.SystemLog", "list", None, {"limit": "5", "start": "0"}),
+    ("SYNO.Core.Log", "list", None, {"limit": "5", "start": "0"}),
+    ("SYNO.Core.SyslogClient.Log", "list", None, {"limit": "5", "start": "0"}),
+]
+
+
+def read_secret(prompt: str) -> str:
+    """Read a secret from a pipe when there is one, otherwise prompt."""
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().rstrip("\n")
+    import getpass
+
+    return getpass.getpass(prompt)
+
+
+def cmd_configure(args) -> int:
+    config = load_config()
+    config["host"] = args.host or config.get("host", "")
+    config["username"] = args.user or config.get("username", "")
+    config["https"] = not args.no_https if args.no_https is not None else config.get("https", True)
+    config["port"] = args.port or config.get("port") or (5001 if config["https"] else 5000)
+    if not config["host"] or not config["username"]:
+        raise SystemExit("Both --host and --user are required the first time")
+
+    if config["https"]:
+        try:
+            fingerprint = PinnedContext.fingerprint(config["host"], int(config["port"]))
+        except Exception as exc:  # noqa: BLE001 - any failure means "cannot pin"
+            raise SystemExit(f"Cannot read the TLS certificate: {exc}")
+        previous = config.get("certFingerprint")
+        if previous and previous != fingerprint and not args.accept_new_cert:
+            raise SystemExit(
+                "The NAS certificate changed.\n"
+                f"  was: {previous}\n"
+                f"  now: {fingerprint}\n"
+                "If you replaced it yourself, re-run with --accept-new-cert."
+            )
+        config["certFingerprint"] = fingerprint
+        config["verifyTls"] = False
+        print(f"Pinned certificate {fingerprint[:16]}…", file=sys.stderr)
+
+    save_config(config)
+    password = read_secret(f"DSM password for {config['username']}@{config['host']}: ")
+    if not password:
+        raise SystemExit("Empty password")
+    secret_store(config, "password", password, f"Omanas DSM password ({config['host']})")
+    print(json.dumps({"ok": True, "config": CONFIG_PATH}))
+    return 0
+
+
+def cmd_login(args) -> int:
+    config = load_config()
+    dsm = Dsm(config)
+    try:
+        result = dsm.login(otp=args.otp, force=args.force)
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.describe()}))
+        return 1
+    print(json.dumps({"ok": True, **result}))
+    return 0
+
+
+def cmd_logout(args) -> int:
+    dsm = Dsm(load_config())
+    dsm.load_session()
+    dsm.logout()
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+def cmd_probe(args) -> int:
+    """Report what this NAS actually exposes, without leaking what it holds."""
+    config = load_config()
+    dsm = Dsm(config)
+    report: dict = {"dsm": {}, "available": {}, "calls": {}}
+
+    apis = dsm.discover()
+    report["dsm"]["apiCount"] = len(apis)
+
+    for label, candidates in WANTED:
+        found = {}
+        for name in candidates:
+            info = apis.get(name)
+            if info:
+                found[name] = {
+                    "path": info.get("path"),
+                    "minVersion": info.get("minVersion"),
+                    "maxVersion": info.get("maxVersion"),
+                }
+        report["available"][label] = found or None
+
+    if args.call:
+        try:
+            dsm.login(otp=args.otp)
+        except DsmError as exc:
+            print(json.dumps({"ok": False, "code": exc.code, "error": exc.describe()}, indent=2))
+            return 1
+        for api, method, version, params in PROBE_CALLS:
+            if api not in apis:
+                continue
+            key = f"{api}.{method}"
+            try:
+                data = dsm.call(api, method, version, params, post=(api == "SYNO.Core.Share"))
+            except DsmError as exc:
+                report["calls"][key] = {"error": exc.code, "message": exc.describe()}
+            except SystemExit as exc:
+                report["calls"][key] = {"error": "transport", "message": str(exc)}
+            else:
+                report["calls"][key] = data if args.raw else shape(data)
+
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omanas",
+        description="Synology DSM client backing the Omanas Omarchy plugin.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    configure = sub.add_parser("configure", help="Save NAS address and credentials")
+    configure.add_argument("--host", help="NAS hostname or IP")
+    configure.add_argument("--port", type=int, help="DSM port (default 5001 https / 5000 http)")
+    configure.add_argument("--user", help="DSM account name")
+    configure.add_argument("--no-https", action="store_true", default=None, help="Use plain HTTP")
+    configure.add_argument("--accept-new-cert", action="store_true", help="Accept a changed certificate")
+    configure.set_defaults(func=cmd_configure)
+
+    login = sub.add_parser("login", help="Open a DSM session")
+    login.add_argument("--otp", help="Two-factor code, if the account needs one")
+    login.add_argument("--force", action="store_true", help="Ignore any cached session")
+    login.set_defaults(func=cmd_login)
+
+    logout = sub.add_parser("logout", help="Close the DSM session")
+    logout.set_defaults(func=cmd_logout)
+
+    probe = sub.add_parser("probe", help="Report which APIs this NAS exposes")
+    probe.add_argument("--call", action="store_true", help="Also call read-only endpoints")
+    probe.add_argument("--raw", action="store_true", help="Print real values instead of shapes")
+    probe.add_argument("--otp", help="Two-factor code, if the account needs one")
+    probe.set_defaults(func=cmd_probe)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.describe()}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
