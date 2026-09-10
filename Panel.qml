@@ -56,7 +56,7 @@ Panel {
   function toggleShare(share) {
     if (!share) return
     if (share.mounted) nas.unmountShare(share.name)
-    else if (share.locked) unlockingShare = share.name
+    else if (share.locked === true) unlockingShare = share.name
     else nas.mountShare(share.name, false, false)
   }
 
@@ -81,6 +81,7 @@ Panel {
     // The setup form holds the typed password across a two-factor round
     // trip; once there is a session, that copy has no reason to exist.
     onConnectedChanged: if (connected && setupForm) setupForm.clearPassword()
+    onUnlocked: root.unlockingShare = ""
   }
 
   IpcHandler {
@@ -495,6 +496,16 @@ Panel {
     readonly property bool isUnlocking: root.unlockingShare === String(share ? share.name : "")
     readonly property bool cryptoSupported: String(nas.capabilities.crypto || "") !== ""
 
+    // The passphrase leaves QML the moment it is handed over, whether or not
+    // DSM accepts it. A rejected one is retyped, not remembered.
+    function submitPassphrase() {
+      if (!cryptoSupported || !share) return
+      var value = passphrase.text
+      passphrase.text = ""
+      if (value.length === 0) return
+      nas.unlockShare(share.name, value)
+    }
+
     implicitHeight: rowColumn.implicitHeight + Style.space(8)
 
     CursorSurface {
@@ -539,13 +550,13 @@ Panel {
         }
 
         Badge {
-          visible: row.share && row.share.locked
+          visible: row.share && row.share.locked === true
           text: "locked"
           tone: root.urgent
         }
 
         Badge {
-          visible: row.share && row.share.encrypted && !row.share.locked
+          visible: row.share && row.share.encrypted && row.share.locked !== true
           text: "encrypted"
           tone: Color.accent
         }
@@ -594,11 +605,32 @@ Panel {
           enabled: row.cryptoSupported
           placeholderText: "Encryption passphrase"
           foreground: root.foreground
-          onAccepted: {
-            // Wired once the probe confirms which API DSM serves.
-            passphrase.text = ""
-            root.unlockingShare = ""
+          onAccepted: row.submitPassphrase()
+        }
+
+        RowLayout {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Button {
+            text: "Unlock"
+            fontSize: Style.font.caption
+            foreground: root.foreground
+            enabled: row.cryptoSupported
+            onClicked: row.submitPassphrase()
           }
+
+          Button {
+            text: "Cancel"
+            fontSize: Style.font.caption
+            foreground: root.foreground
+            onClicked: {
+              passphrase.text = ""
+              root.unlockingShare = ""
+            }
+          }
+
+          Item { Layout.fillWidth: true }
         }
       }
 
@@ -608,7 +640,7 @@ Panel {
         visible: row.hasCursor && !row.isUnlocking
 
         Button {
-          visible: row.share && !row.share.mounted && !row.share.locked
+          visible: row.share && !row.share.mounted && row.share.locked !== true
           text: "Mount"
           fontSize: Style.font.caption
           foreground: root.foreground
@@ -616,7 +648,7 @@ Panel {
         }
 
         Button {
-          visible: row.share && !row.share.mounted && !row.share.locked
+          visible: row.share && !row.share.mounted && row.share.locked !== true
           text: "Mount & keep"
           tooltipText: "Also add an /etc/fstab entry, so later mounts need no password"
           fontSize: Style.font.caption
@@ -625,11 +657,21 @@ Panel {
         }
 
         Button {
-          visible: row.share && row.share.locked
+          visible: row.share && row.share.locked === true
           text: "Unlock"
           fontSize: Style.font.caption
           foreground: root.foreground
           onClicked: root.unlockingShare = row.share.name
+        }
+
+        Button {
+          visible: row.share && row.share.encrypted && row.share.locked === false
+                   && !row.share.mounted
+          text: "Lock"
+          tooltipText: "Lock this folder on the NAS again"
+          fontSize: Style.font.caption
+          foreground: root.foreground
+          onClicked: nas.lockShare(row.share.name)
         }
 
         Button {

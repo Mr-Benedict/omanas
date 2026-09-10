@@ -133,25 +133,19 @@ class Utilisation(unittest.TestCase):
 
 
 class Encryption(unittest.TestCase):
-    """DSM has spelled this several ways; all of them must read."""
+    """encryption is a flag, not a state. Confirmed against DSM 7.4."""
 
-    def test_nested_object(self):
-        self.assertEqual(mod.share_encryption(
-            {"encryption": {"encrypted": True, "mounted": False}}), (True, True))
-        self.assertEqual(mod.share_encryption(
-            {"encryption": {"encrypted": True, "mounted": True}}), (True, False))
-
-    def test_integer_forms(self):
-        self.assertEqual(mod.share_encryption({"encryption": 0}), (False, False))
-        self.assertEqual(mod.share_encryption({"encryption": 1}), (True, False))
-        self.assertEqual(mod.share_encryption({"encryption": 2}), (True, True))
+    def test_flag_forms(self):
+        self.assertFalse(mod.share_encryption({"encryption": 0}))
+        self.assertTrue(mod.share_encryption({"encryption": 1}))
 
     def test_absent_means_not_encrypted(self):
-        self.assertEqual(mod.share_encryption({}), (False, False))
-        self.assertEqual(mod.share_encryption({"encryption": ""}), (False, False))
+        self.assertFalse(mod.share_encryption({}))
+        self.assertFalse(mod.share_encryption({"encryption": ""}))
 
-    def test_alternate_boolean_key(self):
-        self.assertEqual(mod.share_encryption({"is_encrypted": True}), (True, False))
+    def test_alternate_spellings(self):
+        self.assertTrue(mod.share_encryption({"is_encrypted": True}))
+        self.assertTrue(mod.share_encryption({"encryption": {"encrypted": True}}))
 
 
 class Mounts(unittest.TestCase):
@@ -181,15 +175,34 @@ class Mounts(unittest.TestCase):
 
 
 class Shares(unittest.TestCase):
-    def test_sorted_and_marked_with_local_mount_state(self):
-        data = {"shares": [
-            {"name": "photos", "vol_path": "/volume1", "encryption": 0},
-            {"name": "Backups", "vol_path": "/volume1", "encryption": 2},
-        ]}
-        out = mod.normalise_shares(data, "nas")
+    DATA = {"shares": [
+        {"name": "photos", "vol_path": "/volume1", "encryption": 0},
+        {"name": "Backups", "vol_path": "/volume1", "encryption": 1},
+    ]}
+
+    def test_sorted_by_name(self):
+        out = mod.normalise_shares(self.DATA, "nas", {"photos", "Backups"})
         self.assertEqual([s["name"] for s in out], ["Backups", "photos"])
-        self.assertTrue(out[0]["encrypted"])
-        self.assertTrue(out[0]["locked"])
+
+    def test_encrypted_share_absent_from_file_station_is_locked(self):
+        # A locked shared folder is not exported, so File Station cannot see
+        # it. That absence is the only signal DSM gives.
+        out = mod.normalise_shares(self.DATA, "nas", accessible={"photos"})
+        locked = {s["name"]: s["locked"] for s in out}
+        self.assertTrue(locked["Backups"])
+        self.assertFalse(locked["photos"])
+
+    def test_encrypted_share_that_is_visible_is_unlocked(self):
+        out = mod.normalise_shares(self.DATA, "nas", accessible={"photos", "Backups"})
+        locked = {s["name"]: s["locked"] for s in out}
+        self.assertFalse(locked["Backups"])
+
+    def test_unknown_when_file_station_cannot_answer(self):
+        # Guessing "unlocked" here is what sent a mount at a locked share.
+        out = mod.normalise_shares(self.DATA, "nas", accessible=None)
+        locked = {s["name"]: s["locked"] for s in out}
+        self.assertIsNone(locked["Backups"])
+        self.assertFalse(locked["photos"])
 
     def test_nameless_entries_are_dropped(self):
         out = mod.normalise_shares({"shares": [{"vol_path": "/volume1"}]}, "nas")

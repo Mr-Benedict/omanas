@@ -48,11 +48,12 @@ Item {
   readonly property bool hasShares: shares.length > 0
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 60, 10, 3600)
-  readonly property int resourcePollSec: intSetting("resourcePollSec", 2, 1, 30)
+  readonly property int resourcePollSec: intSetting("resourcePollSec", 3, 1, 30)
   readonly property int logCount: intSetting("logCount", 10, 0, 100)
   readonly property string mountRoot: String(setting("mountRoot", "~/mnt/nas"))
 
   signal diagnosticsReady(string report)
+  signal unlocked(string share)
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -205,6 +206,22 @@ Item {
               "Unmounting " + name + "…")
   }
 
+  // Held only between pressing Unlock and the helper starting, then wiped.
+  property string _pendingPassphrase: ""
+
+  function unlockShare(name, passphrase) {
+    if (unlockProcess.running) return
+    _pendingPassphrase = String(passphrase || "")
+    actionStatus = "Unlocking " + name + "…"
+    lastError = ""
+    unlockProcess.command = [helperPath, "unlock", "--share", String(name)]
+    unlockProcess.running = true
+  }
+
+  function lockShare(name) {
+    runAction([helperPath, "lock", "--share", String(name)], "Locking " + name + "…")
+  }
+
   function forgetShare(name) {
     runAction([helperPath, "forget", "--share", String(name), "--mount-root", mountRoot],
               "Forgetting " + name + "…")
@@ -288,6 +305,38 @@ Item {
       else if (exitCode !== 0) root.lastError = String(actionErr.text || "").trim() || "That did not work"
       // Mount state is read back from the system rather than assumed, so a
       // half-succeeded action still leaves the panel telling the truth.
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: unlockProcess
+    running: false
+    command: []
+    stdinEnabled: true
+    stdout: StdioCollector { id: unlockOut; waitForEnd: true }
+    stderr: StdioCollector { id: unlockErr; waitForEnd: true }
+    onStarted: {
+      write(root._pendingPassphrase + "\n")
+      stdinEnabled = false
+      root._pendingPassphrase = ""
+    }
+    onExited: function(exitCode) {
+      root.actionStatus = ""
+      var parsed = null
+      try {
+        parsed = JSON.parse(String(unlockOut.text || "").trim())
+      } catch (e) {
+        parsed = null
+      }
+      if (parsed && parsed.ok) {
+        root.lastError = ""
+        root.unlocked(String(parsed.share || ""))
+      } else if (parsed) {
+        root.lastError = String(parsed.error || "Could not unlock the folder")
+      } else {
+        root.lastError = String(unlockErr.text || "").trim() || "Could not unlock the folder"
+      }
       root.refresh()
     }
   }

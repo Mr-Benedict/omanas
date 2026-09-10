@@ -17,10 +17,12 @@ import base64
 import hashlib
 import json
 import os
+import socket
 import ssl
 import subprocess
 import sys
 import time
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +31,8 @@ CONFIG_DIR = os.path.expanduser("~/.config/omanas")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 CACHE_DIR = os.path.expanduser("~/.cache/omanas")
 SESSION_PATH = os.path.join(CACHE_DIR, "session.json")
+DNS_PATH = os.path.join(CACHE_DIR, "dns.json")
+APIS_PATH = os.path.join(CACHE_DIR, "apis.json")
 
 KEYRING_SERVICE = "omanas"
 SESSION_NAME = "Omanas"
@@ -48,6 +52,13 @@ AUTH_ERRORS = {
     410: "Password must be changed",
     411: "Account locked",
 }
+# SYNO.Core.Share.Crypto reports in its own range rather than the common one.
+CRYPTO_ERRORS = {
+    3308: "Wrong encryption passphrase",
+    3309: "The shared folder is already unlocked",
+    3310: "No such encrypted shared folder",
+}
+
 COMMON_ERRORS = {
     100: "Unknown error",
     101: "Invalid parameter",
@@ -71,7 +82,8 @@ class DsmError(Exception):
         super().__init__(self.describe())
 
     def describe(self) -> str:
-        text = AUTH_ERRORS.get(self.code) or COMMON_ERRORS.get(self.code)
+        text = (AUTH_ERRORS.get(self.code) or CRYPTO_ERRORS.get(self.code)
+                or COMMON_ERRORS.get(self.code))
         where = f" ({self.api}.{self.method})" if self.api else ""
         return f"{text}{where}" if text else f"DSM error {self.code}{where}"
 
@@ -166,6 +178,66 @@ def secret_clear(config: dict, kind: str) -> None:
     )
 
 
+# ------------------------------------------------------------------ DNS
+#
+# A NAS is usually reached by an mDNS name like nas.local, and on a machine
+# whose resolver tries mdns_minimal first that lookup can cost a full timeout
+# -- measured at 5.0s here, every time, with no caching anywhere. A status
+# refresh makes seven calls, so the panel spent half a minute resolving one
+# name it had already resolved six times.
+#
+# The address is therefore resolved once and remembered briefly. The cache is
+# dropped the moment a connection fails, so a NAS that moves to a new DHCP
+# lease costs one retry rather than a permanent outage.
+DNS_TTL_SECONDS = 600
+
+
+def _read_dns_cache() -> dict:
+    try:
+        with open(DNS_PATH, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_dns_cache(cache: dict) -> None:
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    tmp = DNS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle)
+        os.replace(tmp, DNS_PATH)
+    except OSError:
+        pass
+
+
+def forget_host(host: str) -> None:
+    cache = _read_dns_cache()
+    if cache.pop(host, None) is not None:
+        _write_dns_cache(cache)
+
+
+def resolve_host(host: str) -> str:
+    """The NAS's address, resolved at most once every DNS_TTL_SECONDS."""
+    # An address needs no resolving.
+    try:
+        socket.inet_aton(host)
+        return host
+    except OSError:
+        pass
+
+    cache = _read_dns_cache()
+    entry = cache.get(host)
+    if isinstance(entry, dict) and float(entry.get("expires", 0)) > time.time():
+        return str(entry["ip"])
+
+    info = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    ip = info[0][4][0]
+    cache[host] = {"ip": ip, "expires": time.time() + DNS_TTL_SECONDS}
+    _write_dns_cache(cache)
+    return ip
+
+
 # ------------------------------------------------------------------- TLS
 
 
@@ -195,9 +267,7 @@ class PinnedContext:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        import socket
-
-        with socket.create_connection((host, port), timeout=10) as raw:
+        with socket.create_connection((resolve_host(host), port), timeout=10) as raw:
             with ctx.wrap_socket(raw, server_hostname=host) as sock:
                 der = sock.getpeercert(binary_form=True)
         return hashlib.sha256(der).hexdigest()
@@ -216,6 +286,7 @@ class Dsm:
         self.timeout = timeout
         self.sid: str | None = None
         self.apis: dict[str, dict] = {}
+        self._conn: http.client.HTTPConnection | None = None
         self._ctx = PinnedContext(config).build()
         if not self.host:
             raise SystemExit("No NAS configured. Run: omanas configure --host ... --user ...")
@@ -225,49 +296,158 @@ class Dsm:
         scheme = "https" if self.https else "http"
         return f"{scheme}://{self.host}:{self.port}"
 
-    def _open(self, url: str, data: bytes | None = None) -> dict:
-        request = urllib.request.Request(url, data=data)
-        request.add_header("User-Agent", "Omanas/0.1 (+https://github.com/Mr-Benedict/omanas)")
-        if data is not None:
-            request.add_header("Content-Type", "application/x-www-form-urlencoded")
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=self._ctx) as response:
-                payload = response.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as exc:
-            raise SystemExit(f"HTTP {exc.code} from {self.host}")
-        except urllib.error.URLError as exc:
-            reason = str(exc.reason)
-            if not self.https and ("BadStatusLine" in reason or "RemoteDisconnected" in reason
-                                   or int(self.port) == HTTPS_PORT):
-                raise SystemExit(
-                    f"Port {self.port} answered with something that is not HTTP. "
-                    "It is probably DSM's HTTPS port — turn HTTPS on.")
-            raise SystemExit(f"Cannot reach {self.host}:{self.port} — {reason}")
-        try:
-            return json.loads(payload)
-        except ValueError:
-            raise SystemExit(f"{self.host} did not return JSON (is the port right?)")
+    def _close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
 
-    def discover(self) -> dict[str, dict]:
+    def _connect(self) -> http.client.HTTPConnection:
+        """One connection per process, reused by every call.
+
+        Besides saving a TLS handshake per request, this is where the pinned
+        certificate is actually compared. Recording a fingerprint during setup
+        and never checking it again would make the pin decorative.
+        """
+        if self._conn is not None:
+            return self._conn
+
+        address = resolve_host(self.host)
+        if self.https:
+            conn = http.client.HTTPSConnection(
+                address, self.port, timeout=self.timeout, context=self._ctx)
+            conn.connect()
+            presented = hashlib.sha256(
+                conn.sock.getpeercert(binary_form=True)).hexdigest()
+            pinned = self.config.get("certFingerprint")
+            if pinned and presented != pinned:
+                conn.close()
+                raise SystemExit(
+                    "The NAS certificate does not match the one Omanas pinned.\n"
+                    f"  pinned:    {pinned}\n"
+                    f"  presented: {presented}\n"
+                    "If you replaced the certificate yourself, reconnect from the "
+                    "panel to accept the new one."
+                )
+        else:
+            conn = http.client.HTTPConnection(address, self.port, timeout=self.timeout)
+            conn.connect()
+
+        self._conn = conn
+        return conn
+
+    def _request(self, path: str, query: str = "", body: str | None = None) -> dict:
+        target = "/webapi/" + path + (("?" + query) if query else "")
+        headers = {
+            "User-Agent": "Omanas/0.1 (+https://github.com/Mr-Benedict/omanas)",
+            # The connection is made to a cached address, so the name has to
+            # travel in the header for DSM's own virtual-host handling.
+            "Host": self.host,
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        for attempt in (0, 1):
+            reused = self._conn is not None
+            try:
+                conn = self._connect()
+                conn.request("POST" if body is not None else "GET", target, body, headers)
+                response = conn.getresponse()
+                payload = response.read().decode("utf-8", "replace")
+            except ssl.SSLError as exc:
+                self._close()
+                raise SystemExit(describe_tls_failure(exc, self.port))
+            except (http.client.HTTPException, OSError) as exc:
+                self._close()
+                if attempt == 0:
+                    # A kept-alive connection the NAS has since dropped just
+                    # needs remaking. A first-connection failure may mean the
+                    # NAS moved, so the cached address is discarded too.
+                    if not reused:
+                        forget_host(self.host)
+                    continue
+                if not self.https and int(self.port) == HTTPS_PORT:
+                    raise SystemExit(
+                        f"Port {self.port} answered with something that is not HTTP. "
+                        "It is probably DSM's HTTPS port — turn HTTPS on.")
+                raise SystemExit(f"Cannot reach {self.host}:{self.port} — {exc}")
+
+            if response.status != 200:
+                raise SystemExit(f"HTTP {response.status} from {self.host}")
+            try:
+                return json.loads(payload)
+            except ValueError:
+                raise SystemExit(f"{self.host} did not return JSON (is the port right?)")
+        raise SystemExit(f"Cannot reach {self.host}:{self.port}")
+
+    # The API map is a few hundred entries and changes only when DSM is
+    # updated, but it was being fetched on every helper invocation -- the
+    # resource poll runs every two seconds and paid for it each time.
+    APIS_TTL_SECONDS = 3600
+
+    def _cached_apis(self) -> dict[str, dict] | None:
+        try:
+            with open(APIS_PATH, encoding="utf-8") as handle:
+                cached = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        if cached.get("host") != self.host:
+            return None
+        if float(cached.get("expires", 0)) < time.time():
+            return None
+        apis = cached.get("apis")
+        return apis if isinstance(apis, dict) and apis else None
+
+    def _store_apis(self, apis: dict) -> None:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        tmp = APIS_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump({"host": self.host, "apis": apis,
+                           "expires": time.time() + self.APIS_TTL_SECONDS}, handle)
+            os.replace(tmp, APIS_PATH)
+        except OSError:
+            pass
+
+    def forget_apis(self) -> None:
+        self.apis = {}
+        try:
+            os.remove(APIS_PATH)
+        except OSError:
+            pass
+
+    def discover(self, refresh: bool = False) -> dict[str, dict]:
         """Ask DSM which APIs exist, rather than hardcoding paths.
 
         Paths and version ranges move between DSM releases; SYNO.API.Info is
         the one stable way to find out what this particular NAS offers.
         """
-        if self.apis:
+        if self.apis and not refresh:
             return self.apis
+        if not refresh:
+            cached = self._cached_apis()
+            if cached:
+                self.apis = cached
+                return self.apis
         query = urllib.parse.urlencode(
             {"api": "SYNO.API.Info", "version": "1", "method": "query", "query": "all"}
         )
-        body = self._open(f"{self.base}/webapi/query.cgi?{query}")
+        body = self._request("query.cgi", query)
         if not body.get("success"):
             raise DsmError(body.get("error", {}).get("code", 0), "SYNO.API.Info", "query")
         self.apis = body.get("data") or {}
+        self._store_apis(self.apis)
         return self.apis
 
     def entry(self, api: str) -> tuple[str, int]:
         """Resolve an API name to its CGI path and a usable version."""
         info = self.discover().get(api)
+        if not info:
+            # Possibly a cached map from before a DSM update. Pay for one
+            # fresh lookup before reporting the API as missing.
+            info = self.discover(refresh=True).get(api)
         if not info:
             raise DsmError(102, api, "")
         return str(info.get("path", "entry.cgi")), int(info.get("maxVersion", 1))
@@ -289,11 +469,11 @@ class Dsm:
         fields.update({k: str(v) for k, v in (params or {}).items()})
         if self.sid:
             fields["_sid"] = self.sid
-        url = f"{self.base}/webapi/{path}"
+        encoded = urllib.parse.urlencode(fields)
         if post:
-            body = self._open(url, urllib.parse.urlencode(fields).encode())
+            body = self._request(path, body=encoded)
         else:
-            body = self._open(f"{url}?{urllib.parse.urlencode(fields)}")
+            body = self._request(path, encoded)
         if not body.get("success"):
             raise DsmError(body.get("error", {}).get("code", 0), api, method)
         return body.get("data") or {}
@@ -543,42 +723,44 @@ def local_mounts(host: str, mounts_text: str | None = None) -> dict[str, str]:
     return found
 
 
-def share_encryption(raw: dict) -> tuple[bool, bool]:
-    """Return (encrypted, locked).
+def share_encryption(raw: dict) -> bool:
+    """Is this share encrypted?
 
-    DSM has spelled this several ways across releases: a bare integer, a
-    boolean, or a nested object. Rather than pick one, read whichever is
-    present. A share that is encrypted but not currently decrypted on the NAS
-    is what the panel calls locked.
+    DSM answers with a plain flag: encryption is 1 for an encrypted share and
+    0 otherwise, on DSM 7.4 at least. It carries no lock state -- an encrypted
+    share reads the same whether or not it is currently unlocked, so locked
+    has to be established elsewhere. See accessible_shares().
     """
     value = raw.get("encryption")
     if isinstance(value, dict):
-        encrypted = bool(first_key(value, "encrypted", "is_encrypted", default=False))
-        # DSM words the decrypted state as "mounted" — the share is unlocked
-        # on the NAS, which is unrelated to whether it is mounted on a client.
-        unlocked = first_key(value, "mounted", "is_mounted", "decrypted")
-        return encrypted, encrypted and not bool(unlocked)
+        return bool(first_key(value, "encrypted", "is_encrypted", default=False))
     if value in (None, ""):
-        encrypted = bool(first_key(raw, "is_encrypted", "enc", default=False))
-        return encrypted, False
-    number = as_number(value, -1)
-    if number == 1:
-        # 1 means encrypted-and-unlocked in the shapes seen so far; a locked
-        # share usually disappears from a plain list instead.
-        return True, False
-    if number == 2:
-        return True, True
-    return bool(number > 0), False
+        return bool(first_key(raw, "is_encrypted", "enc", default=False))
+    return as_number(value, 0) > 0
 
 
-def normalise_shares(data: dict, host: str) -> list[dict]:
+def normalise_shares(data: dict, host: str, accessible: set[str] | None = None) -> list[dict]:
+    """Turn a share list into the panel's model.
+
+    `accessible` is the set of shares File Station can see. A locked shared
+    folder is not exported, so an encrypted share missing from that set is
+    locked. When it is None the lock state is unknown, and the panel offers
+    both actions rather than guessing wrong -- which is what sent a mount at
+    a locked share and produced a confusing authentication error.
+    """
     mounted = local_mounts(host)
     shares = []
     for raw in data.get("shares") or []:
         name = str(first_key(raw, "name", default=""))
         if not name:
             continue
-        encrypted, locked = share_encryption(raw)
+        encrypted = share_encryption(raw)
+        if not encrypted:
+            locked = False
+        elif accessible is None:
+            locked = None
+        else:
+            locked = name not in accessible
         shares.append({
             "name": name,
             "path": str(first_key(raw, "vol_path", "path", default="")),
@@ -592,6 +774,18 @@ def normalise_shares(data: dict, host: str) -> list[dict]:
             "mountpoint": mounted.get(name, ""),
         })
     return sorted(shares, key=lambda s: s["name"].lower())
+
+
+def accessible_shares(dsm: "Dsm") -> set[str] | None:
+    """Shares File Station can actually reach, or None if it cannot say."""
+    try:
+        data = dsm.call("SYNO.FileStation.List", "list_share", params={"limit": "1000"})
+    except (DsmError, SystemExit):
+        return None
+    rows = data.get("shares")
+    if not isinstance(rows, list):
+        return None
+    return {str(row.get("name")) for row in rows if row.get("name")}
 
 
 def normalise_logs(data: dict, limit: int) -> list[dict]:
@@ -788,7 +982,8 @@ def cmd_status(args) -> int:
     section("shares", caps["shares"],
             lambda: normalise_shares(
                 dsm.call("SYNO.Core.Share", "list", params=SHARE_PARAMS, post=True),
-                config["host"]))
+                config["host"],
+                accessible_shares(dsm)))
     section("logs", caps["logs"],
             lambda: normalise_logs(
                 dsm.call(caps["logs"], "list", params={"limit": str(args.logs), "start": "0"}),
@@ -940,6 +1135,52 @@ def cmd_utilisation(args) -> int:
         print(json.dumps({"ok": False, "error": exc.describe()}))
         return 1
     print(json.dumps({"ok": True, "utilisation": normalise_utilisation(data)}))
+    return 0
+
+
+def cmd_unlock(args) -> int:
+    """Unlock an encrypted shared folder on the NAS.
+
+    The passphrase arrives on stdin and goes straight out in the POST body.
+    It is never an argv element, never written down, and never kept: DSM does
+    the decrypting, and the share is then an ordinary share to mount.
+    """
+    config = load_config()
+    dsm = Dsm(config)
+    try:
+        dsm.login()
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "error": exc.describe()}))
+        return 1
+
+    passphrase = sys.stdin.readline().rstrip("\n")
+    if not passphrase:
+        print(json.dumps({"ok": False, "error": "No passphrase given"}))
+        return 1
+
+    try:
+        dsm.call("SYNO.Core.Share.Crypto", "decrypt", post=True,
+                 params={"name": args.share, "password": passphrase})
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.describe()}))
+        return 1
+    finally:
+        passphrase = ""
+    print(json.dumps({"ok": True, "share": args.share}))
+    return 0
+
+
+def cmd_lock(args) -> int:
+    """Lock an encrypted shared folder again."""
+    config = load_config()
+    dsm = Dsm(config)
+    try:
+        dsm.login()
+        dsm.call("SYNO.Core.Share.Crypto", "encrypt", post=True, params={"name": args.share})
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "code": exc.code, "error": exc.describe()}))
+        return 1
+    print(json.dumps({"ok": True, "share": args.share}))
     return 0
 
 
@@ -1112,6 +1353,14 @@ def build_parser() -> argparse.ArgumentParser:
     forget = sub.add_parser("forget", help="Remove a share's fstab entry")
     mount_args(forget)
     forget.set_defaults(func=cmd_forget)
+
+    unlock = sub.add_parser("unlock", help="Unlock an encrypted shared folder")
+    unlock.add_argument("--share", required=True)
+    unlock.set_defaults(func=cmd_unlock)
+
+    lock = sub.add_parser("lock", help="Lock an encrypted shared folder again")
+    lock.add_argument("--share", required=True)
+    lock.set_defaults(func=cmd_lock)
 
     probe = sub.add_parser("probe", help="Report which APIs this NAS exposes")
     probe.add_argument("--call", action="store_true", help="Also call read-only endpoints")

@@ -20,7 +20,7 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 60,
-      "resourcePollSec": 2,
+      "resourcePollSec": 3,
       "logCount": 10,
       "mountRoot": "~/mnt/nas",
       "notifications": "on"
@@ -42,7 +42,7 @@
         "min": 1,
         "max": 30,
         "step": 1,
-        "defaultValue": 2
+        "defaultValue": 3
       },
       {
         "key": "logCount",
