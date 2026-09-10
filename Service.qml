@@ -31,6 +31,11 @@ Item {
   // button that was just pressed to read as a response to it.
   property string pendingShare: ""
   property string pendingAction: ""
+
+  // Panel-wide actions, which belong to no single row: "signout",
+  // "diagnostics". Every call that leaves this machine gets one of these or
+  // a pendingShare, so nothing the user starts looks like nothing happening.
+  property string globalAction: ""
   property bool needsOtp: false
   property string lastError: ""
   property string errorField: ""
@@ -56,6 +61,18 @@ Item {
 
   readonly property string health: Model.healthOf(storage)
   readonly property bool refreshing: statusProcess.running
+
+  function clearPending() {
+    pendingShare = ""
+    pendingAction = ""
+    pendingGuard.stop()
+  }
+
+  function globalLabel(action) {
+    if (action === "signout") return "Signing out…"
+    if (action === "diagnostics") return "Collecting…"
+    return "Working…"
+  }
 
   function pendingLabel(action) {
     if (action === "mount") return "Mounting…"
@@ -89,8 +106,15 @@ Item {
 
   // -- reading ---------------------------------------------------------
 
+  property bool _refreshQueued: false
+
   function refresh() {
-    if (statusProcess.running) return
+    if (statusProcess.running) {
+      // Losing this would strand a row on its pending state, because the
+      // pending marker is cleared by the arrival of fresh data.
+      _refreshQueued = true
+      return
+    }
     busy = true
     statusProcess.command = [helperPath, "status", "--logs", String(logCount)]
     statusProcess.running = true
@@ -129,6 +153,16 @@ Item {
     if (parsed.shares) shares = parsed.shares
     if (parsed.logs) logs = parsed.logs
     if (parsed.utilisation) recordUtilisation(parsed.utilisation)
+
+    // Fresh state has landed, so a row waiting on an action can now render
+    // the real outcome. Clearing the marker when the process exited instead
+    // put the Mount button back for the couple of seconds before this
+    // arrived, and the row flicked Mount -> Mounting -> Mount -> Unmount.
+    //
+    // Not while an action is still running, though: the periodic poll can
+    // finish mid-mount, and it was started before the action so it cannot
+    // possibly reflect it. That action's own refresh clears the marker.
+    if (!actionProcess.running && !unlockProcess.running) clearPending()
   }
 
   function recordUtilisation(sample) {
@@ -194,11 +228,22 @@ Item {
 
   function disconnect() {
     if (actionProcess.running) return
+    // Signing out is a round trip to DSM to drop the session, so it waits
+    // like anything else rather than blanking the panel instantly.
+    globalAction = "signout"
+    actionStatus = "Signing out…"
     actionProcess.command = [helperPath, "logout"]
     actionProcess.running = true
+  }
+
+  function applySignOut() {
+    globalAction = ""
     connected = false
+    configured = false
     shares = []
     logs = []
+    storage = ({ volumes: [], disks: [] })
+    system = ({})
   }
 
   // -- mounting --------------------------------------------------------
@@ -262,6 +307,7 @@ Item {
 
   function copyDiagnostics() {
     if (diagnosticsProcess.running) return
+    globalAction = "diagnostics"
     actionStatus = "Collecting diagnostics…"
     diagnosticsProcess.command = [helperPath, "diagnostics"]
     diagnosticsProcess.running = true
@@ -282,6 +328,10 @@ Item {
       else {
         root.connected = false
         root.lastError = String(statusErr.text || "").trim() || "The helper produced no output"
+      }
+      if (root._refreshQueued) {
+        root._refreshQueued = false
+        Qt.callLater(root.refresh)
       }
     }
   }
@@ -320,18 +370,25 @@ Item {
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.actionStatus = ""
-      root.pendingShare = ""
-      root.pendingAction = ""
+      if (root.globalAction === "signout") {
+        root.applySignOut()
+        return
+      }
       var parsed = null
       try {
         parsed = JSON.parse(String(actionOut.text || "").trim())
       } catch (e) {
         parsed = null
       }
-      if (parsed && parsed.ok) root.lastError = ""
+      var ok = parsed && parsed.ok
+      if (ok) root.lastError = ""
       else if (parsed && parsed.cancelled) root.lastError = ""
       else if (parsed) root.lastError = String(parsed.error || "That did not work")
       else if (exitCode !== 0) root.lastError = String(actionErr.text || "").trim() || "That did not work"
+      // A failure has nothing to wait for: give the buttons back at once.
+      // A success holds its pending state until the refresh proves it.
+      if (ok) pendingGuard.restart()
+      else root.clearPending()
       // Mount state is read back from the system rather than assumed, so a
       // half-succeeded action still leaves the panel telling the truth.
       root.refresh()
@@ -352,8 +409,6 @@ Item {
     }
     onExited: function(exitCode) {
       root.actionStatus = ""
-      root.pendingShare = ""
-      root.pendingAction = ""
       var parsed = null
       try {
         parsed = JSON.parse(String(unlockOut.text || "").trim())
@@ -362,11 +417,13 @@ Item {
       }
       if (parsed && parsed.ok) {
         root.lastError = ""
+        pendingGuard.restart()
         root.unlocked(String(parsed.share || ""))
-      } else if (parsed) {
-        root.lastError = String(parsed.error || "Could not unlock the folder")
       } else {
-        root.lastError = String(unlockErr.text || "").trim() || "Could not unlock the folder"
+        root.lastError = parsed
+          ? String(parsed.error || "Could not unlock the folder")
+          : (String(unlockErr.text || "").trim() || "Could not unlock the folder")
+        root.clearPending()
       }
       root.refresh()
     }
@@ -395,6 +452,7 @@ Item {
     stdout: StdioCollector { id: diagOut; waitForEnd: true }
     onExited: function(exitCode) {
       root.actionStatus = ""
+      root.globalAction = ""
       var report = String(diagOut.text || "").trim()
       if (!report) {
         root.lastError = "Could not collect diagnostics"
@@ -409,6 +467,15 @@ Item {
   }
 
   Process { id: clipboardProcess; running: false; command: [] }
+
+  // Last resort. If the refresh that should end a pending state never
+  // arrives, the row must not sit on "Mounting…" for the rest of the
+  // session.
+  Timer {
+    id: pendingGuard
+    interval: 30000
+    onTriggered: root.clearPending()
+  }
 
   Timer {
     id: clearStatus

@@ -287,6 +287,13 @@ Panel {
             onChanged: function(value) { root.selectTab(root.tabsIndexOf(value)) }
           }
 
+          PendingLine {
+            width: parent.width
+            visible: nas.connected && nas.refreshing && nas.pendingShare === ""
+                     && nas.globalAction === ""
+            text: "Refreshing…"
+          }
+
           Text {
             width: parent.width
             visible: nas.connected && (nas.actionStatus !== "" || nas.lastError !== "")
@@ -503,19 +510,23 @@ Panel {
               spacing: Style.space(8)
 
               Button {
-                text: "Copy diagnostics"
+                text: nas.globalAction === "diagnostics"
+                      ? nas.globalLabel("diagnostics") : "Copy diagnostics"
                 tooltipText: "A redacted report of what your DSM exposes, for a bug report"
                 foreground: root.foreground
                 fontSize: Style.font.bodySmall
+                enabled: nas.globalAction === ""
                 onClicked: nas.copyDiagnostics()
               }
 
               Item { Layout.fillWidth: true }
 
               Button {
-                text: "Sign out"
+                text: nas.globalAction === "signout"
+                      ? nas.globalLabel("signout") : "Sign out"
                 foreground: root.foreground
                 fontSize: Style.font.bodySmall
+                enabled: nas.globalAction === ""
                 onClicked: nas.disconnect()
               }
             }
