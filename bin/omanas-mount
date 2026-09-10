@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Omanas privileged mount helper — the only part that runs as root.
+
+Invoked through pkexec by the plugin. Everything it is asked to do is
+validated here rather than trusted from the caller, because the caller is
+unprivileged QML and this is not.
+
+Three rules shape the whole file:
+
+  * The SMB password arrives on stdin and reaches mount.cifs through a 0600
+    credentials file. It never becomes an argv element, which /proc would
+    expose to every user on this machine.
+  * The caller's identity comes from PKEXEC_UID, which pkexec sets itself.
+    Nothing about who the caller is, is taken from the arguments.
+  * A mountpoint must resolve inside the calling user's home directory. That
+    is what stops a crafted request from mounting a share over /etc.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+FSTAB = "/etc/fstab"
+BEGIN = "# >>> omanas managed >>>"
+END = "# <<< omanas managed <<<"
+
+# Share and host names are pasted into a device string and, for persistent
+# shares, into /etc/fstab. Anything outside these sets could smuggle in a
+# separate mount option or an extra fstab field.
+SHARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,253}$")
+USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$")
+
+
+def fail(message: str, code: int = 1):
+    print(json.dumps({"ok": False, "error": message}), file=sys.stdout)
+    sys.exit(code)
+
+
+def caller() -> pwd.struct_passwd:
+    """Who asked. pkexec sets PKEXEC_UID; the arguments do not get a vote."""
+    raw = os.environ.get("PKEXEC_UID")
+    if raw is None:
+        # Running under plain sudo is fine for testing, but then there is no
+        # trustworthy caller identity, so refuse rather than guess.
+        fail("PKEXEC_UID is not set — run this through pkexec, not directly")
+    try:
+        return pwd.getpwuid(int(raw))
+    except (ValueError, KeyError):
+        fail("PKEXEC_UID does not name a real user")
+
+
+def checked_mountpoint(user: pwd.struct_passwd, path: str) -> str:
+    """Resolve a mountpoint and refuse anything outside the caller's home.
+
+    realpath first, so symlinks cannot walk out of the home directory after
+    the check.
+    """
+    resolved = os.path.realpath(os.path.expanduser(path))
+    home = os.path.realpath(user.pw_dir)
+    if resolved != home and not resolved.startswith(home + os.sep):
+        fail(f"Refusing to mount outside {home}")
+    if resolved == home:
+        fail("Refusing to mount over the home directory itself")
+    return resolved
+
+
+def ensure_dir(user: pwd.struct_passwd, path: str) -> None:
+    if os.path.ismount(path):
+        fail("Already mounted")
+    if os.path.isdir(path):
+        if os.listdir(path):
+            fail("Mount point is not empty")
+        return
+    if os.path.exists(path):
+        fail("Mount point exists and is not a directory")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    # The directory belongs to the user, not to root, so they can still remove
+    # it once the share is unmounted.
+    os.chown(path, user.pw_uid, user.pw_gid)
+
+
+def mount_options(user: pwd.struct_passwd, extra_ro: bool) -> str:
+    options = [
+        f"uid={user.pw_uid}",
+        f"gid={user.pw_gid}",
+        "file_mode=0700",
+        "dir_mode=0700",
+        "iocharset=utf8",
+        # SMB1 is broken; refusing to negotiate down is worth an explicit flag.
+        "vers=3.0",
+        "nosuid",
+        "nodev",
+        "noexec",
+    ]
+    if extra_ro:
+        options.append("ro")
+    return ",".join(options)
+
+
+def cmd_mount(args) -> int:
+    user = caller()
+    if not HOST_RE.match(args.host):
+        fail("Invalid host")
+    if not SHARE_RE.match(args.share):
+        fail("Invalid share name")
+    if not USER_RE.match(args.account):
+        fail("Invalid account name")
+
+    target = checked_mountpoint(user, args.mountpoint)
+    password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        fail("No password on stdin")
+
+    ensure_dir(user, target)
+
+    # mount.cifs reads the credentials file itself, so the password never
+    # appears in this process's argv or in the mount table.
+    handle, credentials = tempfile.mkstemp(prefix="omanas-", dir="/run")
+    try:
+        with os.fdopen(handle, "w") as stream:
+            os.chmod(credentials, 0o600)
+            stream.write(f"username={args.account}\npassword={password}\n")
+        result = subprocess.run(
+            [
+                "mount", "-t", "cifs",
+                f"//{args.host}/{args.share}", target,
+                "-o", f"credentials={credentials}," + mount_options(user, args.read_only),
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        try:
+            os.remove(credentials)
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        try:
+            os.rmdir(target)
+        except OSError:
+            pass
+        fail(detail[-1] if detail else f"mount failed with status {result.returncode}")
+
+    print(json.dumps({"ok": True, "mountpoint": target}))
+    return 0
+
+
+def cmd_unmount(args) -> int:
+    user = caller()
+    target = checked_mountpoint(user, args.mountpoint)
+    if not os.path.ismount(target):
+        fail("Not mounted")
+    result = subprocess.run(["umount", target], capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        fail(detail[-1] if detail else "umount failed")
+    try:
+        os.rmdir(target)
+    except OSError:
+        pass
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+# ------------------------------------------------------------------ fstab
+#
+# Persistence lives inside a marked block. Lines outside it are never read,
+# rewritten or reordered, so a bug here cannot cost someone their root
+# filesystem entry.
+
+
+def entry_target(line: str) -> str:
+    """The mount point an fstab line refers to, with \\040 escapes undone."""
+    fields = line.split()
+    return fields[1].replace("\\040", " ") if len(fields) > 1 else ""
+
+
+def ensure_dir_exists(user: pwd.struct_passwd, path: str) -> None:
+    """Create a mount point if missing, tolerating one that is already in use."""
+    if os.path.isdir(path):
+        return
+    if os.path.exists(path):
+        fail("Mount point exists and is not a directory")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chown(path, user.pw_uid, user.pw_gid)
+
+
+def read_fstab() -> tuple[list[str], list[str]]:
+    with open(FSTAB, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    if BEGIN not in lines or END not in lines:
+        return lines, []
+    start, stop = lines.index(BEGIN), lines.index(END)
+    before = lines[:start]
+    # The blank line ahead of the block is ours, not the user's. Returning it
+    # as foreign content would hand it back to write_fstab to be preserved,
+    # and the file would gain a blank line on every cycle.
+    while before and not before[-1].strip():
+        before.pop()
+    return before + lines[stop + 1:], lines[start + 1:stop]
+
+
+def write_fstab(outside: list[str], managed: list[str]) -> None:
+    body = list(outside)
+    # read_fstab hands back the blank line that separated the managed block,
+    # so trim trailing blanks before adding another. Otherwise every
+    # persist/forget cycle leaves one more blank line behind in /etc/fstab.
+    while body and not body[-1].strip():
+        body.pop()
+    if managed:
+        if body:
+            body.append("")
+        body += [BEGIN, *managed, END]
+    text = "\n".join(body).rstrip("\n") + "\n"
+
+    directory = os.path.dirname(FSTAB)
+    handle, tmp = tempfile.mkstemp(prefix=".omanas-fstab-", dir=directory)
+    try:
+        with os.fdopen(handle, "w") as stream:
+            stream.write(text)
+        os.chmod(tmp, 0o644)
+        # A corrupt fstab is an unbootable machine, so the new file has to
+        # parse before it is allowed to replace the real one.
+        #
+        # findmnt --verify exits non-zero for warnings too, and it warns about
+        # anything it cannot reach right now: a share whose server is offline,
+        # a mount point not yet created. None of that means the file is bad.
+        # A parse error does, so that is the only thing treated as fatal.
+        check = subprocess.run(["findmnt", "--verify", "--tab-file", tmp],
+                               capture_output=True, text=True)
+        report = check.stdout or check.stderr or ""
+        parse_errors = re.search(r"(\d+) parse error", report)
+        if parse_errors and int(parse_errors.group(1)) > 0:
+            detail = [l for l in report.splitlines() if "parse error" in l]
+            fail("Refusing to write fstab: " + (detail[0].strip() if detail else "malformed entry"))
+        backup = FSTAB + ".omanas.bak"
+        try:
+            subprocess.run(["cp", "-a", FSTAB, backup], check=False)
+        except OSError:
+            pass
+        os.replace(tmp, FSTAB)
+        tmp = None
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def fstab_entry(user: pwd.struct_passwd, host: str, share: str, target: str,
+                credentials: str, read_only: bool) -> str:
+    options = ",".join([
+        "noauto",
+        # 'user' is what lets the unprivileged owner mount it later without
+        # pkexec at all, because Arch ships mount.cifs setuid.
+        "user",
+        "_netdev",
+        f"credentials={credentials}",
+        mount_options(user, read_only),
+    ])
+    escaped = target.replace(" ", "\\040")
+    return f"//{host}/{share.replace(' ', '\\040')}  {escaped}  cifs  {options}  0 0"
+
+
+def cmd_persist(args) -> int:
+    user = caller()
+    if not HOST_RE.match(args.host) or not SHARE_RE.match(args.share):
+        fail("Invalid host or share name")
+    if not USER_RE.match(args.account):
+        fail("Invalid account name")
+    target = checked_mountpoint(user, args.mountpoint)
+    password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        fail("No password on stdin")
+
+    # A persistent entry needs a persistent credentials file; it lives in the
+    # user's home, readable only by root, and is removed with the entry.
+    credentials = os.path.join(user.pw_dir, ".config", "omanas", f"creds-{args.share}")
+    os.makedirs(os.path.dirname(credentials), mode=0o700, exist_ok=True)
+    os.chown(os.path.dirname(credentials), user.pw_uid, user.pw_gid)
+    with open(os.open(credentials, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as stream:
+        stream.write(f"username={args.account}\npassword={password}\n")
+
+    # Create the mount point before the fstab entry, so the entry never
+    # names a directory that does not exist yet.
+    ensure_dir_exists(user, target)
+    outside, managed = read_fstab()
+    managed = [line for line in managed if entry_target(line) != target]
+    managed.append(fstab_entry(user, args.host, args.share, target, credentials, args.read_only))
+    write_fstab(outside, managed)
+    print(json.dumps({"ok": True, "mountpoint": target, "persistent": True}))
+    return 0
+
+
+def cmd_forget(args) -> int:
+    user = caller()
+    target = checked_mountpoint(user, args.mountpoint)
+    outside, managed = read_fstab()
+    kept = [line for line in managed if entry_target(line) != target]
+    if len(kept) == len(managed):
+        print(json.dumps({"ok": True, "changed": False}))
+        return 0
+    write_fstab(outside, kept)
+    credentials = os.path.join(user.pw_dir, ".config", "omanas", f"creds-{args.share}")
+    try:
+        os.remove(credentials)
+    except OSError:
+        pass
+    print(json.dumps({"ok": True, "changed": True}))
+    return 0
+
+
+def cmd_list(args) -> int:
+    _, managed = read_fstab()
+    print(json.dumps({"ok": True, "entries": managed}))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="omanas-mount",
+        description="Privileged mount helper for the Omanas Omarchy plugin.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def shared(sp, need_account=True):
+        sp.add_argument("--host", required=True)
+        sp.add_argument("--share", required=True)
+        sp.add_argument("--mountpoint", required=True)
+        if need_account:
+            sp.add_argument("--account", required=True)
+            sp.add_argument("--read-only", action="store_true")
+
+    mount = sub.add_parser("mount", help="Mount a share now")
+    shared(mount)
+    mount.set_defaults(func=cmd_mount)
+
+    unmount = sub.add_parser("unmount", help="Unmount a share")
+    unmount.add_argument("--mountpoint", required=True)
+    unmount.set_defaults(func=cmd_unmount)
+
+    persist = sub.add_parser("persist", help="Add a managed fstab entry")
+    shared(persist)
+    persist.set_defaults(func=cmd_persist)
+
+    forget = sub.add_parser("forget", help="Remove a managed fstab entry")
+    forget.add_argument("--mountpoint", required=True)
+    forget.add_argument("--share", required=True)
+    forget.set_defaults(func=cmd_forget)
+
+    listing = sub.add_parser("list", help="Show managed fstab entries")
+    listing.set_defaults(func=cmd_list)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
