@@ -214,3 +214,30 @@ class Logs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TlsFailureMessages(unittest.TestCase):
+    """OpenSSL says "wrong version number"; the user needs to know what to change."""
+
+    def test_https_against_the_http_port_names_the_fix(self):
+        message = mod.describe_tls_failure(
+            Exception("[SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1082)"), 5000)
+        self.assertIn("5000", message)
+        self.assertIn("5001", message)
+        self.assertNotIn("WRONG_VERSION_NUMBER", message)
+
+    def test_https_against_another_port(self):
+        message = mod.describe_tls_failure(
+            Exception("[SSL: WRONG_VERSION_NUMBER] wrong version number"), 8080)
+        self.assertIn("8080", message)
+        self.assertIn("5001", message)
+
+    def test_certificate_failure_is_not_confused_with_a_port_mistake(self):
+        message = mod.describe_tls_failure(
+            Exception("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"), 5001)
+        self.assertIn("certificate", message.lower())
+        self.assertNotIn("5000", message)
+
+    def test_unknown_failure_still_carries_the_detail(self):
+        message = mod.describe_tls_failure(Exception("something odd"), 5001)
+        self.assertIn("something odd", message)

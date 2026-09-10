@@ -79,6 +79,28 @@ class DsmError(Exception):
 # ---------------------------------------------------------------- config
 
 
+# DSM listens for plain HTTP on 5000 and HTTPS on 5001, and mixing them up is
+# the easiest mistake to make on this form. OpenSSL's own words for it
+# ("wrong version number") describe the packet, not the problem, so both
+# directions get translated into what to actually change.
+HTTP_PORT = 5000
+HTTPS_PORT = 5001
+
+
+def describe_tls_failure(exc: Exception, port: int) -> str:
+    text = str(exc)
+    if "WRONG_VERSION_NUMBER" in text or "UNEXPECTED_MESSAGE" in text or "record layer" in text:
+        if int(port) == HTTP_PORT:
+            return (f"Port {HTTP_PORT} is DSM's plain HTTP port, so it cannot answer HTTPS. "
+                    f"Use port {HTTPS_PORT}, or turn HTTPS off (your password would then "
+                    "cross the network unencrypted).")
+        return (f"Port {port} is not speaking HTTPS. Try DSM's HTTPS port ({HTTPS_PORT}), "
+                "or turn HTTPS off.")
+    if "CERTIFICATE_VERIFY_FAILED" in text:
+        return "The NAS certificate could not be verified."
+    return f"TLS handshake failed: {text}"
+
+
 def load_config() -> dict:
     try:
         with open(CONFIG_PATH, encoding="utf-8") as handle:
@@ -214,7 +236,13 @@ class Dsm:
         except urllib.error.HTTPError as exc:
             raise SystemExit(f"HTTP {exc.code} from {self.host}")
         except urllib.error.URLError as exc:
-            raise SystemExit(f"Cannot reach {self.host}:{self.port} — {exc.reason}")
+            reason = str(exc.reason)
+            if not self.https and ("BadStatusLine" in reason or "RemoteDisconnected" in reason
+                                   or int(self.port) == HTTPS_PORT):
+                raise SystemExit(
+                    f"Port {self.port} answered with something that is not HTTP. "
+                    "It is probably DSM's HTTPS port — turn HTTPS on.")
+            raise SystemExit(f"Cannot reach {self.host}:{self.port} — {reason}")
         try:
             return json.loads(payload)
         except ValueError:
@@ -669,9 +697,13 @@ def cmd_connect(args) -> int:
     if config["https"]:
         try:
             fingerprint = PinnedContext.fingerprint(config["host"], int(config["port"]))
-        except Exception as exc:  # noqa: BLE001
+        except ssl.SSLError as exc:
+            print(json.dumps({"ok": False, "field": "port",
+                              "error": describe_tls_failure(exc, config["port"])}))
+            return 1
+        except OSError as exc:
             print(json.dumps({"ok": False, "field": "host",
-                              "error": f"Cannot reach the NAS over HTTPS: {exc}"}))
+                              "error": f"Cannot reach {config['host']}:{config['port']} — {exc}"}))
             return 1
         previous = config.get("certFingerprint")
         if previous and previous != fingerprint and not args.accept_new_cert:

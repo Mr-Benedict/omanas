@@ -107,6 +107,15 @@ Item {
             checked: true
             foreground: root.foreground
             anchors.verticalCenter: parent.verticalCenter
+            onToggled: {
+              checked = !checked
+              // Move the port with the scheme only when it is still the
+              // other scheme's default; a deliberate port is left alone.
+              var current = portField.text.trim()
+              if (current === "" || current === "5000" || current === "5001") {
+                portField.text = checked ? "5001" : "5000"
+              }
+            }
           }
 
           Text {
