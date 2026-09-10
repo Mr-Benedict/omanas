@@ -21,6 +21,16 @@ Item {
   property bool configured: false
   property bool connected: false
   property bool busy: false
+  // False until the first status answer lands, whatever it says. Without it
+  // the panel cannot tell "no NAS configured" from "have not looked yet",
+  // and shows the setup form to someone who is merely waiting.
+  property bool loaded: false
+
+  // Which share is mid-action, and which action. The row shows its own
+  // progress; a status line at the top of the panel is too far from the
+  // button that was just pressed to read as a response to it.
+  property string pendingShare: ""
+  property string pendingAction: ""
   property bool needsOtp: false
   property string lastError: ""
   property string errorField: ""
@@ -45,6 +55,17 @@ Item {
   readonly property int historyLength: 40
 
   readonly property string health: Model.healthOf(storage)
+  readonly property bool refreshing: statusProcess.running
+
+  function pendingLabel(action) {
+    if (action === "mount") return "Mounting…"
+    if (action === "persist") return "Mounting…"
+    if (action === "unmount") return "Unmounting…"
+    if (action === "unlock") return "Unlocking…"
+    if (action === "lock") return "Locking…"
+    if (action === "forget") return "Updating…"
+    return "Working…"
+  }
   readonly property bool hasShares: shares.length > 0
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 60, 10, 3600)
@@ -77,6 +98,7 @@ Item {
 
   function applyStatus(raw) {
     var parsed
+    loaded = true
     try {
       parsed = JSON.parse(String(raw || "").trim())
     } catch (e) {
@@ -186,9 +208,11 @@ Item {
     return null
   }
 
-  function runAction(argv, status) {
+  function runAction(argv, share, action) {
     if (actionProcess.running) return
-    actionStatus = status
+    pendingShare = String(share || "")
+    pendingAction = String(action || "")
+    actionStatus = pendingLabel(pendingAction) + (share ? " " + share : "")
     lastError = ""
     actionProcess.command = argv
     actionProcess.running = true
@@ -198,12 +222,12 @@ Item {
     var argv = [helperPath, "mount", "--share", String(name), "--mount-root", mountRoot]
     if (persist) argv.push("--persist")
     if (readOnly) argv.push("--read-only")
-    runAction(argv, "Mounting " + name + "…")
+    runAction(argv, name, persist ? "persist" : "mount")
   }
 
   function unmountShare(name) {
     runAction([helperPath, "unmount", "--share", String(name), "--mount-root", mountRoot],
-              "Unmounting " + name + "…")
+              name, "unmount")
   }
 
   // Held only between pressing Unlock and the helper starting, then wiped.
@@ -212,6 +236,8 @@ Item {
   function unlockShare(name, passphrase) {
     if (unlockProcess.running) return
     _pendingPassphrase = String(passphrase || "")
+    pendingShare = String(name)
+    pendingAction = "unlock"
     actionStatus = "Unlocking " + name + "…"
     lastError = ""
     unlockProcess.command = [helperPath, "unlock", "--share", String(name)]
@@ -219,12 +245,12 @@ Item {
   }
 
   function lockShare(name) {
-    runAction([helperPath, "lock", "--share", String(name)], "Locking " + name + "…")
+    runAction([helperPath, "lock", "--share", String(name)], name, "lock")
   }
 
   function forgetShare(name) {
     runAction([helperPath, "forget", "--share", String(name), "--mount-root", mountRoot],
-              "Forgetting " + name + "…")
+              name, "forget")
   }
 
   function openMountpoint(share) {
@@ -276,6 +302,7 @@ Item {
     }
     onExited: function(exitCode) {
       root.busy = false
+      root.loaded = true
       var out = String(connectOut.text || "")
       if (out.trim().length > 0) root.applyConnect(out)
       else {
@@ -293,6 +320,8 @@ Item {
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.actionStatus = ""
+      root.pendingShare = ""
+      root.pendingAction = ""
       var parsed = null
       try {
         parsed = JSON.parse(String(actionOut.text || "").trim())
@@ -323,6 +352,8 @@ Item {
     }
     onExited: function(exitCode) {
       root.actionStatus = ""
+      root.pendingShare = ""
+      root.pendingAction = ""
       var parsed = null
       try {
         parsed = JSON.parse(String(unlockOut.text || "").trim())

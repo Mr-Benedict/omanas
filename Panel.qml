@@ -33,6 +33,31 @@ Panel {
   // time: the prompt is a modal step, not a per-row control.
   property string unlockingShare: ""
 
+  // Three tabs, because the popout is about 400px wide and storage,
+  // resources, folders and logs together overflowed it into a scroll.
+  property string tab: "overview"
+  readonly property var tabs: [
+    { value: "overview", label: "Overview" },
+    { value: "folders", label: "Folders" },
+    { value: "logs", label: "Logs" }
+  ]
+
+  function selectTab(index) {
+    var wrapped = ((index % tabs.length) + tabs.length) % tabs.length
+    tab = String(tabs[wrapped].value)
+    if (panelFlick) panelFlick.contentY = 0
+  }
+
+  function tabsIndexOf(value) {
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].value === String(value)) return i
+    return 0
+  }
+
+  function tabIndex() {
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].value === tab) return i
+    return 0
+  }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -90,6 +115,15 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { nas.refresh(); return "ok" }
+    // Scriptable tab switching, so a keybind can open the panel straight to
+    // the folder list.
+    function showTab(name: string): string {
+      var wanted = String(name)
+      for (var i = 0; i < root.tabs.length; i++) {
+        if (root.tabs[i].value === wanted) { root.selectTab(i); return wanted }
+      }
+      return root.tab
+    }
     function status(): string { return nas.connected ? nas.health : "offline" }
   }
 
@@ -130,6 +164,7 @@ Panel {
       // eat what the user is typing.
       blocked: !nas.connected || root.unlockingShare !== ""
       onMoveRequested: function(dx, dy) {
+        if (dx !== 0) { root.selectTab(root.tabIndex() + dx); return }
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
       }
@@ -138,7 +173,10 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         var key = String(t).toLowerCase()
-        if (key === "r") nas.refresh()
+        if (key === "1") root.selectTab(0)
+        else if (key === "2") root.selectTab(1)
+        else if (key === "3") root.selectTab(2)
+        else if (key === "r") nas.refresh()
         else if (key === "d") nas.copyDiagnostics()
         else if (key === "o") nas.openMountpoint(root.selectedShare())
       }
@@ -166,10 +204,46 @@ Panel {
 
           // -- setup ---------------------------------------------------
 
+          // Before the first answer there is nothing honest to show but
+          // that we are looking.
+          Item {
+            width: parent.width
+            visible: !nas.loaded
+            implicitHeight: Style.space(120)
+
+            Column {
+              anchors.centerIn: parent
+              spacing: Style.space(10)
+
+              NasIcon {
+                anchors.horizontalCenter: parent.horizontalCenter
+                iconSize: Style.font.display
+                color: root.dim
+                health: "offline"
+              }
+
+              Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "Loading…"
+                textFormat: Text.PlainText
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+
+                SequentialAnimation on opacity {
+                  running: !nas.loaded
+                  loops: Animation.Infinite
+                  NumberAnimation { to: 0.4; duration: 700; easing.type: Easing.InOutQuad }
+                  NumberAnimation { to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
+                }
+              }
+            }
+          }
+
           UI.SetupForm {
             id: setupForm
             width: parent.width
-            visible: !nas.connected
+            visible: nas.loaded && !nas.connected
             foreground: root.foreground
             fontFamily: root.fontFamily
             busy: nas.busy
@@ -202,6 +276,17 @@ Panel {
             }
           }
 
+          ButtonGroup {
+            width: parent.width
+            visible: nas.connected
+            options: root.tabs
+            value: root.tab
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            onChanged: function(value) { root.selectTab(root.tabsIndexOf(value)) }
+          }
+
           Text {
             width: parent.width
             visible: nas.connected && (nas.actionStatus !== "" || nas.lastError !== "")
@@ -217,7 +302,7 @@ Panel {
 
           Column {
             width: parent.width
-            visible: nas.connected && storageRepeater.count > 0
+            visible: nas.connected && root.tab === "overview" && storageRepeater.count > 0
             spacing: Style.space(10)
 
             PanelSectionHeader {
@@ -272,7 +357,8 @@ Panel {
 
           Column {
             width: parent.width
-            visible: nas.connected && nas.capabilities.utilisation === true
+            visible: nas.connected && root.tab === "overview"
+                     && nas.capabilities.utilisation === true
             spacing: Style.space(8)
 
             PanelSectionHeader {
@@ -315,7 +401,8 @@ Panel {
 
           Column {
             width: parent.width
-            visible: nas.connected && nas.capabilities.shares === true
+            visible: nas.connected && root.tab === "folders"
+                     && nas.capabilities.shares === true
             spacing: Style.space(6)
 
             PanelSectionHeader {
@@ -352,7 +439,7 @@ Panel {
 
           Column {
             width: parent.width
-            visible: nas.connected && nas.logs.length > 0
+            visible: nas.connected && root.tab === "logs" && nas.logs.length > 0
             spacing: Style.space(6)
 
             PanelSectionHeader {
@@ -495,6 +582,10 @@ Panel {
     readonly property bool hasCursor: root.cursorActive && root.shareIndex === rowIndex
     readonly property bool isUnlocking: root.unlockingShare === String(share ? share.name : "")
     readonly property bool cryptoSupported: String(nas.capabilities.crypto || "") !== ""
+    readonly property string shareName: String(share ? share.name : "")
+    // This row is the one waiting on something.
+    readonly property bool isPending: nas.pendingShare !== "" && nas.pendingShare === shareName
+    readonly property bool failedHere: nas.lastError !== "" && row.isUnlocking && !row.isPending
 
     // The passphrase leaves QML the moment it is handed over, whether or not
     // DSM accepts it. A rejected one is retyped, not remembered.
@@ -568,6 +659,12 @@ Panel {
         }
       }
 
+      PendingLine {
+        width: parent.width
+        visible: row.isPending && !row.isUnlocking
+        text: nas.pendingLabel(nas.pendingAction)
+      }
+
       Text {
         width: parent.width
         visible: row.share && row.share.mounted && String(row.share.mountpoint || "") !== ""
@@ -601,6 +698,7 @@ Panel {
         TextField {
           id: passphrase
           width: parent.width
+          visible: !row.isPending
           password: true
           enabled: row.cryptoSupported
           placeholderText: "Encryption passphrase"
@@ -608,9 +706,30 @@ Panel {
           onAccepted: row.submitPassphrase()
         }
 
+        // What replaces the field while DSM is deciding. Unlocking takes a
+        // second or two on the NAS, and an unchanged prompt read as nothing
+        // having happened.
+        PendingLine {
+          width: parent.width
+          visible: row.isPending
+          text: nas.pendingLabel(nas.pendingAction)
+        }
+
+        Text {
+          width: parent.width
+          visible: row.failedHere
+          text: nas.lastError
+          textFormat: Text.PlainText
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
         RowLayout {
           width: parent.width
           spacing: Style.space(6)
+          visible: !row.isPending
 
           Button {
             text: "Unlock"
@@ -637,7 +756,7 @@ Panel {
       RowLayout {
         width: parent.width
         spacing: Style.space(6)
-        visible: row.hasCursor && !row.isUnlocking
+        visible: row.hasCursor && !row.isUnlocking && !row.isPending
 
         Button {
           visible: row.share && !row.share.mounted && row.share.locked !== true
@@ -692,6 +811,25 @@ Panel {
 
         Item { Layout.fillWidth: true }
       }
+    }
+  }
+
+  // Shared "something is happening" line. The pulse is what distinguishes
+  // it from ordinary static text at a glance.
+  component PendingLine: Text {
+    id: pendingLine
+    textFormat: Text.PlainText
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+
+    SequentialAnimation on opacity {
+      // Bound to this line's own visibility; `parent` here would be whatever
+      // column it was dropped into.
+      running: pendingLine.visible
+      loops: Animation.Infinite
+      NumberAnimation { to: 0.35; duration: 650; easing.type: Easing.InOutQuad }
+      NumberAnimation { to: 1.0; duration: 650; easing.type: Easing.InOutQuad }
     }
   }
 
