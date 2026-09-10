@@ -47,6 +47,15 @@ Most of the health, resource and log endpoints require an account in the
 **administrators** group. A non-admin account still works; the panel just
 shows less.
 
+### Two-factor accounts
+
+Signing in with 2FA takes two round trips: the first is refused with "code
+required", and the second carries the code. Omanas asks for the code in the
+same form, keeps the password you already typed across that gap, and puts the
+code field back when DSM says a code was wrong rather than making you start
+over. On success it stores DSM's device token, so the same machine is not
+asked again.
+
 ## Mounting shared folders
 
 Mounts are on demand by default. Clicking *Mount* runs a small root helper
@@ -73,6 +82,20 @@ README documents how — it stays your decision, not the installer's.
 passphrase to `SYNO.Core.Share.Crypto`, DSM decrypts it, and the share becomes
 readable. The passphrase travels to the helper over stdin and is not stored
 unless you ask Omanas to remember it in the keyring.
+
+## Developing
+
+```bash
+ln -s ~/Work/omanas ~/.config/omarchy/plugins/io.github.mr-benedict.omanas
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.mr-benedict.omanas --section right
+python3 -m unittest discover -s tests
+```
+
+Note that the shell's plugin hot-reload does **not** follow a symlinked
+plugin directory. While developing through a symlink, `omarchy restart shell`
+is what actually picks up a change; a `rescanPlugins` will appear to succeed
+while the old code keeps running.
 
 ## Licence
 

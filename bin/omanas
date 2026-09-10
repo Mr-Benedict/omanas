@@ -304,10 +304,18 @@ class Dsm:
         os.chmod(tmp, 0o600)
         os.replace(tmp, SESSION_PATH)
 
-    def login(self, otp: str | None = None, force: bool = False) -> dict:
+    def login(self, otp: str | None = None, force: bool = False,
+              password: str | None = None) -> dict:
+        """Open a session.
+
+        A caller that already holds the password passes it in, so a credential
+        can be proven before it is written anywhere. Everyone else gets it
+        from the keyring.
+        """
         if not force and self.load_session():
             return {"reused": True}
-        password = secret_lookup(self.config, "password")
+        if password is None:
+            password = secret_lookup(self.config, "password")
         if not password:
             raise SystemExit("No password in the keyring. Run: omanas configure ...")
         params = {
@@ -358,6 +366,223 @@ class Dsm:
 # Numbers survive verbatim — they say whether a field is bytes, kilobytes or
 # a percentage, which is the whole reason to look, and they identify nobody.
 
+# --------------------------------------------------------- normalisation
+#
+# Everything above talks to DSM. Everything below turns what DSM said into
+# one stable shape the QML panel can render.
+#
+# This layer exists because the panel must not care which DSM version it is
+# talking to. Field names here are empirical — taken from open source clients
+# that read them off real NASes — so every reader tolerates a missing key, a
+# string where a number belongs, and a renamed field, rather than raising.
+
+
+def as_number(value, default=0.0) -> float:
+    """DSM returns sizes as strings, percentages as ints, and gaps as ''."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def first_key(source: dict, *names, default=None):
+    """Take whichever spelling of a field this DSM happens to use."""
+    for name in names:
+        if isinstance(source, dict) and source.get(name) not in (None, ""):
+            return source[name]
+    return default
+
+
+def parse_uptime(value) -> int:
+    """up_time is seconds on some models and HH:MM:SS on others."""
+    if value is None:
+        return 0
+    text = str(value).strip()
+    if text.isdigit():
+        return int(text)
+    parts = text.split(":")
+    if len(parts) == 3 and all(p.strip().isdigit() for p in parts):
+        hours, minutes, seconds = (int(p) for p in parts)
+        return hours * 3600 + minutes * 60 + seconds
+    return 0
+
+
+def normalise_system(data: dict) -> dict:
+    return {
+        "model": str(first_key(data, "model", default="")),
+        "version": str(first_key(data, "firmware_ver", "version", default="")),
+        "uptimeSec": parse_uptime(first_key(data, "up_time", "uptime")),
+        "tempC": int(as_number(first_key(data, "sys_temp", "temperature"), 0)),
+        "cpuSeries": str(first_key(data, "cpu_series", "cpu_family", default="")),
+        "cpuCores": str(first_key(data, "cpu_cores", default="")),
+        "ramMb": int(as_number(first_key(data, "ram_size"), 0)),
+        # The serial identifies the box; the panel never needs it, so it is
+        # reduced to a suffix that is enough to tell two NASes apart.
+        "serialSuffix": str(first_key(data, "serial", default=""))[-4:],
+    }
+
+
+def normalise_storage(data: dict) -> dict:
+    volumes = []
+    for raw in data.get("volumes") or []:
+        size = raw.get("size") if isinstance(raw.get("size"), dict) else {}
+        total = as_number(first_key(size, "total", default=raw.get("total")))
+        used = as_number(first_key(size, "used", default=raw.get("used")))
+        volumes.append({
+            "id": str(first_key(raw, "id", "name", default="")),
+            "label": str(first_key(raw, "display_name", "desc", "id", default="")),
+            "status": str(first_key(raw, "status", default="unknown")),
+            "fsType": str(first_key(raw, "fs_type", "device_type", default="")),
+            "totalBytes": total,
+            "usedBytes": used,
+            "percent": round(used / total * 100, 1) if total else 0.0,
+        })
+
+    disks = []
+    for raw in data.get("disks") or []:
+        disks.append({
+            "id": str(first_key(raw, "id", "device", default="")),
+            "name": str(first_key(raw, "name", "model", default="")),
+            "status": str(first_key(raw, "status", default="unknown")),
+            "smart": str(first_key(raw, "smart_status", "smart_test_status", default="unknown")),
+            "tempC": int(as_number(first_key(raw, "temp", "temperature"), 0)),
+            # Either threshold tripping is a reason to warn even while SMART
+            # still calls the disk healthy.
+            "warning": bool(raw.get("exceed_bad_sector_thr") or raw.get("below_remain_life_thr")),
+        })
+
+    return {"volumes": volumes, "disks": disks}
+
+
+def normalise_utilisation(data: dict) -> dict:
+    cpu = data.get("cpu") or {}
+    memory = data.get("memory") or {}
+    network = data.get("network") or []
+
+    # DSM reports CPU as three separate loads rather than one number.
+    cpu_percent = sum(
+        as_number(cpu.get(key)) for key in ("user_load", "system_load", "other_load")
+    )
+
+    total_real = as_number(memory.get("total_real"))
+    avail_real = as_number(memory.get("avail_real"))
+    if memory.get("real_usage") not in (None, ""):
+        mem_percent = as_number(memory.get("real_usage"))
+    elif total_real:
+        mem_percent = round((total_real - avail_real) / total_real * 100, 1)
+    else:
+        mem_percent = 0.0
+
+    # The list carries one entry per interface plus a "total" row; prefer the
+    # total when DSM provides it rather than double-counting bonded links.
+    total_row = next((n for n in network if str(n.get("device", "")).lower() == "total"), None)
+    rows = [total_row] if total_row else network
+    return {
+        "cpuPercent": round(min(cpu_percent, 100.0), 1),
+        "memPercent": round(min(mem_percent, 100.0), 1),
+        "memTotalBytes": total_real * 1024,
+        "netRxBps": sum(as_number(n.get("rx")) for n in rows),
+        "netTxBps": sum(as_number(n.get("tx")) for n in rows),
+    }
+
+
+def local_mounts(host: str, mounts_text: str | None = None) -> dict[str, str]:
+    """Which of this NAS's shares are mounted here, by share name.
+
+    Read from /proc/self/mounts rather than remembered in a file, so the panel
+    still shows the truth after a share is unmounted behind its back.
+    """
+    found: dict[str, str] = {}
+    if mounts_text is not None:
+        lines = mounts_text.splitlines()
+    else:
+        try:
+            with open("/proc/self/mounts", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return found
+    prefix = f"//{host}/".lower()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3 or fields[2] not in ("cifs", "smb3"):
+            continue
+        source = fields[0].replace("\\040", " ")
+        if source.lower().startswith(prefix):
+            share = source[len(prefix):]
+            found[share] = fields[1].replace("\\040", " ")
+    return found
+
+
+def share_encryption(raw: dict) -> tuple[bool, bool]:
+    """Return (encrypted, locked).
+
+    DSM has spelled this several ways across releases: a bare integer, a
+    boolean, or a nested object. Rather than pick one, read whichever is
+    present. A share that is encrypted but not currently decrypted on the NAS
+    is what the panel calls locked.
+    """
+    value = raw.get("encryption")
+    if isinstance(value, dict):
+        encrypted = bool(first_key(value, "encrypted", "is_encrypted", default=False))
+        # DSM words the decrypted state as "mounted" — the share is unlocked
+        # on the NAS, which is unrelated to whether it is mounted on a client.
+        unlocked = first_key(value, "mounted", "is_mounted", "decrypted")
+        return encrypted, encrypted and not bool(unlocked)
+    if value in (None, ""):
+        encrypted = bool(first_key(raw, "is_encrypted", "enc", default=False))
+        return encrypted, False
+    number = as_number(value, -1)
+    if number == 1:
+        # 1 means encrypted-and-unlocked in the shapes seen so far; a locked
+        # share usually disappears from a plain list instead.
+        return True, False
+    if number == 2:
+        return True, True
+    return bool(number > 0), False
+
+
+def normalise_shares(data: dict, host: str) -> list[dict]:
+    mounted = local_mounts(host)
+    shares = []
+    for raw in data.get("shares") or []:
+        name = str(first_key(raw, "name", default=""))
+        if not name:
+            continue
+        encrypted, locked = share_encryption(raw)
+        shares.append({
+            "name": name,
+            "path": str(first_key(raw, "vol_path", "path", default="")),
+            "description": str(first_key(raw, "desc", "description", default="")),
+            "encrypted": encrypted,
+            "locked": locked,
+            "hidden": bool(first_key(raw, "hidden", default=False)),
+            "readOnly": bool(first_key(raw, "is_force_readonly", default=False)),
+            "quotaUsedBytes": as_number(first_key(raw, "share_quota_used")) * 1024 * 1024,
+            "mounted": name in mounted,
+            "mountpoint": mounted.get(name, ""),
+        })
+    return sorted(shares, key=lambda s: s["name"].lower())
+
+
+def normalise_logs(data: dict, limit: int) -> list[dict]:
+    rows = data.get("items") or data.get("logs") or data.get("data") or []
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for raw in rows[:limit]:
+        if not isinstance(raw, dict):
+            continue
+        out.append({
+            "level": str(first_key(raw, "level", "type", default="info")).lower(),
+            "time": str(first_key(raw, "time", "logtime", "timestamp", default="")),
+            "who": str(first_key(raw, "who", "user", default="")),
+            "message": str(first_key(raw, "descr", "desc", "message", "event", default="")),
+        })
+    return out
+
+
 # ------------------------------------------------------------- commands
 #
 # Endpoints the panel wants. The first four are well mapped by existing open
@@ -384,19 +609,306 @@ WANTED = [
 ]
 
 # Read-only calls probe may make. Nothing here changes NAS state.
+SHARE_PARAMS = {
+    "additional": '["hidden","encryption","share_quota","recyclebin","is_force_readonly"]',
+    "shareType": "all",
+}
+
 PROBE_CALLS = [
     ("SYNO.Core.System", "info", None, {}),
     ("SYNO.Core.System.Utilization", "get", None, {}),
     ("SYNO.Storage.CGI.Storage", "load_info", None, {}),
-    ("SYNO.Core.Share", "list", None, {
-        "additional": '["hidden","encryption","share_quota","recyclebin"]',
-        "shareType": "all",
-    }),
+    ("SYNO.Core.Share", "list", None, SHARE_PARAMS),
     ("SYNO.Core.Share.Crypto", "list", None, {}),
     ("SYNO.Core.SystemLog", "list", None, {"limit": "5", "start": "0"}),
     ("SYNO.Core.Log", "list", None, {"limit": "5", "start": "0"}),
     ("SYNO.Core.SyslogClient.Log", "list", None, {"limit": "5", "start": "0"}),
 ]
+
+
+def capabilities(dsm: Dsm) -> dict:
+    """Which features this particular NAS can actually support.
+
+    The panel greys out what is missing rather than showing a control that
+    fails when pressed, so this is read once per connection and drives the UI.
+    """
+    apis = dsm.discover()
+    logs_api = next((name for name in (
+        "SYNO.Core.SystemLog", "SYNO.Core.Log", "SYNO.Core.SyslogClient.Log",
+        "SYNO.LogCenter.Log",
+    ) if name in apis), "")
+    storage_api = next((name for name in (
+        "SYNO.Storage.CGI.Storage", "SYNO.Core.Storage.Volume",
+    ) if name in apis), "")
+    crypto_api = next((name for name in (
+        "SYNO.Core.Share.Crypto", "SYNO.Core.Share.Crypto.KeyManager.Store",
+    ) if name in apis), "")
+    return {
+        "system": "SYNO.Core.System" in apis,
+        "utilisation": "SYNO.Core.System.Utilization" in apis,
+        "storage": storage_api,
+        "shares": "SYNO.Core.Share" in apis,
+        "crypto": crypto_api,
+        "logs": logs_api,
+    }
+
+
+def cmd_connect(args) -> int:
+    """Save a NAS and prove the credentials work, in one step.
+
+    The panel calls this from its setup form. Its job is to give the form
+    something actionable back: which field was wrong, or that a two-factor
+    code is needed, rather than a bare failure.
+    """
+    config = load_config()
+    config["host"] = args.host
+    config["username"] = args.user
+    config["https"] = not args.no_https
+    config["port"] = args.port or (5001 if config["https"] else 5000)
+
+    if config["https"]:
+        try:
+            fingerprint = PinnedContext.fingerprint(config["host"], int(config["port"]))
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"ok": False, "field": "host",
+                              "error": f"Cannot reach the NAS over HTTPS: {exc}"}))
+            return 1
+        previous = config.get("certFingerprint")
+        if previous and previous != fingerprint and not args.accept_new_cert:
+            print(json.dumps({
+                "ok": False, "field": "certificate", "certChanged": True,
+                "was": previous, "now": fingerprint,
+                "error": "The NAS certificate changed since you last connected.",
+            }))
+            return 1
+        config["certFingerprint"] = fingerprint
+        config["verifyTls"] = False
+
+    password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        # Re-verifying an existing NAS: fall back to what is already saved.
+        password = secret_lookup(config, "password")
+    if not password:
+        print(json.dumps({"ok": False, "field": "password", "error": "No password given"}))
+        return 1
+
+    # Nothing is written until the credential is proven. A typo should not
+    # leave a wrong password sitting in the keyring.
+    dsm = Dsm(config)
+    try:
+        dsm.login(otp=args.otp, force=True, password=password)
+    except DsmError as exc:
+        field = {400: "password", 403: "otp", 404: "otp", 406: "otp"}.get(exc.code, "")
+        # 403 asks for a code, 404 says the code was wrong, 406 says the
+        # account requires one. All three need the code field on screen --
+        # dropping it on 404 left no way to retype a mistyped code.
+        print(json.dumps({
+            "ok": False, "code": exc.code, "field": field,
+            "needsOtp": exc.code in (403, 404, 406),
+            "error": exc.describe(),
+        }))
+        return 1
+    save_config(config)
+    secret_store(config, "password", password, f"Omanas DSM password ({config['host']})")
+    print(json.dumps({"ok": True, "host": config["host"], "capabilities": capabilities(dsm)}))
+    return 0
+
+
+def cmd_status(args) -> int:
+    """One shot of everything the panel shows.
+
+    A section that fails carries its own error instead of sinking the whole
+    response — a NAS that refuses the log API should still show its storage.
+    """
+    config = load_config()
+    if not config.get("host"):
+        print(json.dumps({"ok": False, "configured": False}))
+        return 0
+
+    dsm = Dsm(config)
+    try:
+        dsm.login()
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "configured": True, "code": exc.code,
+                          "needsOtp": exc.code in (403, 404, 406), "error": exc.describe()}))
+        return 1
+
+    caps = capabilities(dsm)
+    out: dict = {"ok": True, "configured": True, "host": config["host"],
+                 "capabilities": caps, "errors": {}}
+
+    def section(name: str, enabled, call):
+        if not enabled:
+            return
+        try:
+            out[name] = call()
+        except DsmError as exc:
+            out["errors"][name] = exc.describe()
+        except SystemExit as exc:
+            out["errors"][name] = str(exc)
+
+    section("system", caps["system"],
+            lambda: normalise_system(dsm.call("SYNO.Core.System", "info")))
+    section("utilisation", caps["utilisation"],
+            lambda: normalise_utilisation(dsm.call("SYNO.Core.System.Utilization", "get")))
+    section("storage", caps["storage"],
+            lambda: normalise_storage(dsm.call(caps["storage"], "load_info")))
+    section("shares", caps["shares"],
+            lambda: normalise_shares(
+                dsm.call("SYNO.Core.Share", "list", params=SHARE_PARAMS, post=True),
+                config["host"]))
+    section("logs", caps["logs"],
+            lambda: normalise_logs(
+                dsm.call(caps["logs"], "list", params={"limit": str(args.logs), "start": "0"}),
+                args.logs))
+
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_diagnostics(args) -> int:
+    """The report behind the panel's Copy button.
+
+    Always redacted: it describes the shape of each response so a rendering
+    bug can be diagnosed, without carrying share names or serial numbers out
+    of the user's house.
+    """
+    config = load_config()
+    dsm = Dsm(config)
+    report: dict = {"omanas": "0.1.0", "available": {}, "calls": {}}
+    apis = dsm.discover()
+    report["apiCount"] = len(apis)
+    for label, candidates in WANTED:
+        report["available"][label] = {
+            name: {"path": apis[name].get("path"), "maxVersion": apis[name].get("maxVersion")}
+            for name in candidates if name in apis
+        } or None
+    try:
+        dsm.login(otp=args.otp)
+    except DsmError as exc:
+        report["loginError"] = exc.describe()
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 1
+    for api, method, version, params in PROBE_CALLS:
+        if api not in apis:
+            continue
+        try:
+            data = dsm.call(api, method, version, params, post=(api == "SYNO.Core.Share"))
+        except DsmError as exc:
+            report["calls"][f"{api}.{method}"] = {"error": exc.code, "message": exc.describe()}
+        except SystemExit as exc:
+            report["calls"][f"{api}.{method}"] = {"error": "transport", "message": str(exc)}
+        else:
+            report["calls"][f"{api}.{method}"] = shape(data)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+# ----------------------------------------------------------- mounting
+#
+# The panel asks this helper to mount a share; this helper asks the root
+# helper. The chain exists so the SMB password can go from the keyring
+# straight into pkexec's stdin without the QML layer ever holding it.
+
+MOUNT_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omanas-mount")
+
+
+def mount_target(config: dict, mount_root: str, share: str) -> str:
+    root = os.path.expanduser(mount_root or "~/mnt/nas")
+    return os.path.join(root, share)
+
+
+def run_privileged(arguments: list[str], password: str | None) -> dict:
+    """Call the root helper through pkexec, feeding the password on stdin."""
+    if not os.path.exists(MOUNT_HELPER):
+        return {"ok": False, "error": f"Mount helper missing at {MOUNT_HELPER}"}
+    try:
+        result = subprocess.run(
+            ["pkexec", MOUNT_HELPER, *arguments],
+            input=(password + "\n") if password is not None else "",
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "pkexec is not installed"}
+    if result.stdout.strip():
+        try:
+            return json.loads(result.stdout.strip().splitlines()[-1])
+        except ValueError:
+            pass
+    if result.returncode == 126:
+        # polkit's own code for "the user dismissed the dialog".
+        return {"ok": False, "cancelled": True, "error": "Authentication cancelled"}
+    if result.returncode == 127:
+        return {"ok": False, "error": "pkexec could not run the mount helper"}
+    detail = (result.stderr or "").strip().splitlines()
+    return {"ok": False, "error": detail[-1] if detail else "Mount helper failed"}
+
+
+def cmd_mount(args) -> int:
+    config = load_config()
+    password = secret_lookup(config, "password")
+    if not password:
+        print(json.dumps({"ok": False, "error": "No password in the keyring"}))
+        return 1
+    target = mount_target(config, args.mount_root, args.share)
+    arguments = [
+        "persist" if args.persist else "mount",
+        "--host", config["host"],
+        "--share", args.share,
+        "--mountpoint", target,
+        "--account", config["username"],
+    ]
+    if args.read_only:
+        arguments.append("--read-only")
+    result = run_privileged(arguments, password)
+
+    # A persisted share is only recorded by 'persist'; mounting it is still a
+    # separate step, and one that now needs no password at all.
+    if result.get("ok") and args.persist:
+        mount = subprocess.run(["mount", target], capture_output=True, text=True)
+        if mount.returncode != 0:
+            result["mountError"] = (mount.stderr or mount.stdout).strip()
+        else:
+            result["mounted"] = True
+
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_unmount(args) -> int:
+    config = load_config()
+    target = mount_target(config, args.mount_root, args.share)
+    # An fstab-persisted share carries the 'user' option, so the owner can
+    # unmount it without any privilege at all. Try that before asking polkit.
+    plain = subprocess.run(["umount", target], capture_output=True, text=True)
+    if plain.returncode == 0:
+        print(json.dumps({"ok": True, "elevated": False}))
+        return 0
+    result = run_privileged(["unmount", "--mountpoint", target], None)
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_forget(args) -> int:
+    config = load_config()
+    target = mount_target(config, args.mount_root, args.share)
+    result = run_privileged(["forget", "--mountpoint", target, "--share", args.share], None)
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_utilisation(args) -> int:
+    config = load_config()
+    dsm = Dsm(config)
+    try:
+        dsm.login()
+        data = dsm.call("SYNO.Core.System.Utilization", "get")
+    except DsmError as exc:
+        print(json.dumps({"ok": False, "error": exc.describe()}))
+        return 1
+    print(json.dumps({"ok": True, "utilisation": normalise_utilisation(data)}))
+    return 0
 
 
 def read_secret(prompt: str) -> str:
@@ -529,6 +1041,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     logout = sub.add_parser("logout", help="Close the DSM session")
     logout.set_defaults(func=cmd_logout)
+
+    connect = sub.add_parser("connect", help="Save a NAS and verify credentials")
+    connect.add_argument("--host", required=True)
+    connect.add_argument("--port", type=int)
+    connect.add_argument("--user", required=True)
+    connect.add_argument("--no-https", action="store_true")
+    connect.add_argument("--otp")
+    connect.add_argument("--accept-new-cert", action="store_true")
+    connect.set_defaults(func=cmd_connect)
+
+    status = sub.add_parser("status", help="Everything the panel shows, as JSON")
+    status.add_argument("--logs", type=int, default=10)
+    status.set_defaults(func=cmd_status)
+
+    utilisation = sub.add_parser("utilisation", help="Just the live resource figures")
+    utilisation.set_defaults(func=cmd_utilisation)
+
+    diagnostics = sub.add_parser("diagnostics", help="Redacted report for a bug report")
+    diagnostics.add_argument("--otp")
+    diagnostics.set_defaults(func=cmd_diagnostics)
+
+    def mount_args(sp):
+        sp.add_argument("--share", required=True)
+        sp.add_argument("--mount-root", default="~/mnt/nas")
+
+    mount = sub.add_parser("mount", help="Mount a shared folder locally")
+    mount_args(mount)
+    mount.add_argument("--read-only", action="store_true")
+    mount.add_argument("--persist", action="store_true",
+                       help="Also add a managed /etc/fstab entry")
+    mount.set_defaults(func=cmd_mount)
+
+    unmount = sub.add_parser("unmount", help="Unmount a shared folder")
+    mount_args(unmount)
+    unmount.set_defaults(func=cmd_unmount)
+
+    forget = sub.add_parser("forget", help="Remove a share's fstab entry")
+    mount_args(forget)
+    forget.set_defaults(func=cmd_forget)
 
     probe = sub.add_parser("probe", help="Report which APIs this NAS exposes")
     probe.add_argument("--call", action="store_true", help="Also call read-only endpoints")
