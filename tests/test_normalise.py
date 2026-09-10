@@ -254,3 +254,43 @@ class TlsFailureMessages(unittest.TestCase):
     def test_unknown_failure_still_carries_the_detail(self):
         message = mod.describe_tls_failure(Exception("something odd"), 5001)
         self.assertIn("something odd", message)
+
+
+class HostResolution(unittest.TestCase):
+    def test_a_literal_address_is_not_resolved(self):
+        # Short-circuiting matters: a NAS given by IP should never touch the
+        # resolver, which is where the multi-second mDNS stall lives.
+        self.assertEqual(mod.resolve_host("192.168.1.100"), "192.168.1.100")
+
+    def test_cache_round_trip(self):
+        import tempfile, os, time
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        original = mod.DNS_PATH
+        mod.DNS_PATH = path
+        try:
+            mod._write_dns_cache({"box.local": {"ip": "10.0.0.5",
+                                                "expires": time.time() + 60}})
+            self.assertEqual(mod.resolve_host("box.local"), "10.0.0.5")
+            mod.forget_host("box.local")
+            self.assertEqual(mod._read_dns_cache(), {})
+        finally:
+            mod.DNS_PATH = original
+            os.remove(path)
+
+    def test_expired_entry_is_not_used(self):
+        import tempfile, os, time
+        handle, path = tempfile.mkstemp()
+        os.close(handle)
+        original = mod.DNS_PATH
+        mod.DNS_PATH = path
+        try:
+            mod._write_dns_cache({"gone.invalid": {"ip": "10.0.0.5",
+                                                   "expires": time.time() - 1}})
+            # Expired, and the name does not resolve, so it must raise rather
+            # than hand back a stale address.
+            with self.assertRaises(SystemExit):
+                mod.resolve_host("gone.invalid")
+        finally:
+            mod.DNS_PATH = original
+            os.remove(path)
