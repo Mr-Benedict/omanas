@@ -1,0 +1,20 @@
+# Errors only, not style.
+#
+# The suite already covers behaviour; what a linter adds is the class of bug
+# tests cannot see because the code never runs -- an undefined name on an
+# error path, an import that was dropped. shape() went missing from bin/omanas
+# once and every test passed, because nothing exercised `diagnostics` far
+# enough to reach the NameError. F821 finds that in a second.
+#
+# Style rules are deliberately absent. A contributor's first PR should not
+# turn into an argument about line length.
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["F", "E9"]
+
+[lint.per-file-ignores]
+# Both helpers are loaded by path rather than imported, so the test modules
+# read their globals through a module handle rather than by name.
+"tests/*" = ["F811"]
