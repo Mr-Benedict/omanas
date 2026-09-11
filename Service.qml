@@ -32,9 +32,9 @@ Item {
   property string pendingShare: ""
   property string pendingAction: ""
 
-  // Panel-wide actions, which belong to no single row: "signout",
-  // "diagnostics". Every call that leaves this machine gets one of these or
-  // a pendingShare, so nothing the user starts looks like nothing happening.
+  // Panel-wide actions, which belong to no single row: "signout". Every call
+  // that leaves this machine gets one of these or a pendingShare, so nothing
+  // the user starts looks like nothing happening.
   property string globalAction: ""
   property bool needsOtp: false
   property string lastError: ""
@@ -70,7 +70,6 @@ Item {
 
   function globalLabel(action) {
     if (action === "signout") return "Signing out…"
-    if (action === "diagnostics") return "Collecting…"
     return "Working…"
   }
 
@@ -90,7 +89,6 @@ Item {
   readonly property int logCount: intSetting("logCount", 10, 0, 100)
   readonly property string mountRoot: String(setting("mountRoot", "~/mnt/nas"))
 
-  signal diagnosticsReady(string report)
   signal unlocked(string share)
 
   function setting(name, fallback) {
@@ -305,14 +303,6 @@ Item {
     Quickshell.execDetached(["uwsm-app", "--", "xdg-open", "file://" + parts.join("/")])
   }
 
-  function copyDiagnostics() {
-    if (diagnosticsProcess.running) return
-    globalAction = "diagnostics"
-    actionStatus = "Collecting diagnostics…"
-    diagnosticsProcess.command = [helperPath, "diagnostics"]
-    diagnosticsProcess.running = true
-  }
-
   // -- processes -------------------------------------------------------
 
   Process {
@@ -444,29 +434,6 @@ Item {
       }
     }
   }
-
-  Process {
-    id: diagnosticsProcess
-    running: false
-    command: []
-    stdout: StdioCollector { id: diagOut; waitForEnd: true }
-    onExited: function(exitCode) {
-      root.actionStatus = ""
-      root.globalAction = ""
-      var report = String(diagOut.text || "").trim()
-      if (!report) {
-        root.lastError = "Could not collect diagnostics"
-        return
-      }
-      clipboardProcess.command = ["wl-copy", report]
-      clipboardProcess.running = true
-      root.diagnosticsReady(report)
-      root.actionStatus = "Diagnostics copied to the clipboard"
-      clearStatus.restart()
-    }
-  }
-
-  Process { id: clipboardProcess; running: false; command: [] }
 
   // Last resort. If the refresh that should end a pending state never
   // arrives, the row must not sit on "Mounting…" for the rest of the

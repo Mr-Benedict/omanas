@@ -177,7 +177,6 @@ Panel {
         else if (key === "2") root.selectTab(1)
         else if (key === "3") root.selectTab(2)
         else if (key === "r") nas.refresh()
-        else if (key === "d") nas.copyDiagnostics()
         else if (key === "o") nas.openMountpoint(root.selectedShare())
       }
 
@@ -508,16 +507,6 @@ Panel {
             RowLayout {
               width: parent.width
               spacing: Style.space(8)
-
-              Button {
-                text: nas.globalAction === "diagnostics"
-                      ? nas.globalLabel("diagnostics") : "Copy diagnostics"
-                tooltipText: "A redacted report of what your DSM exposes, for a bug report"
-                foreground: root.foreground
-                fontSize: Style.font.bodySmall
-                enabled: nas.globalAction === ""
-                onClicked: nas.copyDiagnostics()
-              }
 
               Item { Layout.fillWidth: true }
 
