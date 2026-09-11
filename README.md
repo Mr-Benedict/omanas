@@ -59,7 +59,7 @@ anything outside those markers.
 
 - Omarchy 4.x (Quickshell-based shell with the plugin API)
 - A Synology NAS running DSM 7, reachable at a hostname or IP on your network
-- `python` (standard library only — no pip install)
+- `python` (standard library only — no third-party packages)
 - `libsecret` / `secret-tool` for credential storage, and a running keyring
 - `cifs-utils` for mounting shared folders
 
