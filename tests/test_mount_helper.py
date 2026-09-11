@@ -188,7 +188,7 @@ class AccountNames(unittest.TestCase):
     """The account name is written into a credentials file mount.cifs reads."""
 
     def test_accepted(self):
-        for good in ["ben", "ben.gaetani", "ben_1", "ben@nas.local", "a-b"]:
+        for good in ["admin", "backup.svc", "nas_1", "admin@example.net", "a-b"]:
             self.assertTrue(mod.USER_RE.match(good), good)
 
     def test_refused(self):
