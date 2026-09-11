@@ -6,11 +6,13 @@ usable value rather than an exception.
 """
 
 import os
+import tempfile
+import time
 import unittest
-from importlib.machinery import SourceFileLoader
 
-HELPER = os.path.join(os.path.dirname(__file__), "..", "bin", "omanas")
-mod = SourceFileLoader("omanas", HELPER).load_module()
+from helpers import omanas
+
+mod = omanas()
 
 
 class Scalars(unittest.TestCase):
@@ -225,9 +227,6 @@ class Logs(unittest.TestCase):
         self.assertEqual(mod.normalise_logs({}, 10), [])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class TlsFailureMessages(unittest.TestCase):
     """OpenSSL says "wrong version number"; the user needs to know what to change."""
@@ -263,7 +262,6 @@ class HostResolution(unittest.TestCase):
         self.assertEqual(mod.resolve_host("192.168.1.100"), "192.168.1.100")
 
     def test_cache_round_trip(self):
-        import tempfile, os, time
         handle, path = tempfile.mkstemp()
         os.close(handle)
         original = mod.DNS_PATH
@@ -279,7 +277,6 @@ class HostResolution(unittest.TestCase):
             os.remove(path)
 
     def test_expired_entry_is_not_used(self):
-        import tempfile, os, time
         handle, path = tempfile.mkstemp()
         os.close(handle)
         original = mod.DNS_PATH
@@ -294,3 +291,7 @@ class HostResolution(unittest.TestCase):
         finally:
             mod.DNS_PATH = original
             os.remove(path)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
