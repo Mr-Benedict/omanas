@@ -238,7 +238,10 @@ def write_fstab(outside: list[str], managed: list[str]) -> None:
         # A parse error does, so that is the only thing treated as fatal.
         check = subprocess.run(["findmnt", "--verify", "--tab-file", tmp],
                                capture_output=True, text=True)
-        report = check.stdout or check.stderr or ""
+        # Both streams, not whichever is non-empty: findmnt prints the tree it
+        # verified on stdout and the parse-error summary on stderr. Reading
+        # only stdout -- which is never empty -- meant this guard never fired.
+        report = (check.stdout or "") + (check.stderr or "")
         parse_errors = re.search(r"(\d+) parse error", report)
         if parse_errors and int(parse_errors.group(1)) > 0:
             detail = [l for l in report.splitlines() if "parse error" in l]
