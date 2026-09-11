@@ -13,7 +13,6 @@ Standard library only, so the plugin installs by cloning and nothing else.
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import os
@@ -586,6 +585,57 @@ class Dsm:
 # holds. Serial numbers, share names and volume paths stay on the NAS.
 # Numbers survive verbatim — they say whether a field is bytes, kilobytes or
 # a percentage, which is the whole reason to look, and they identify nobody.
+
+# How deep to describe. DSM nests two or three levels; beyond that the report
+# is unreadable anyway, and a cycle would recurse forever.
+SHAPE_MAX_DEPTH = 6
+
+
+def shape(value, depth: int = 0):
+    """Describe a response's structure without carrying its contents out.
+
+    Keys are DSM's own field names and stay verbatim -- they are the schema,
+    which is the thing being reported. Values do not: a string is reduced to
+    its length and whether it looks numeric, which is what the normalisation
+    layer needs to know and says nothing about the NAS. Numbers and booleans
+    survive as they are, per the note above.
+    """
+    if depth >= SHAPE_MAX_DEPTH:
+        return "..."
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        if not value:
+            return "str(empty)"
+        # Sizes and uptimes arrive as strings; saying so is the whole reason
+        # anyone reads this report.
+        kind = "numeric," if value.strip().lstrip("-").replace(".", "", 1).isdigit() else ""
+        return f"str({kind}len={len(value)})"
+    if isinstance(value, dict):
+        return {str(key): shape(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        described = None
+        if items:
+            # Describe the union of the rows rather than only the first. A
+            # field DSM sets on some disks and not others would otherwise be
+            # missing from the report that exists to find it.
+            if all(isinstance(item, dict) for item in items):
+                merged: dict = {}
+                for item in items:
+                    for key, inner in item.items():
+                        if str(key) not in merged or merged[str(key)] is None:
+                            merged[str(key)] = shape(inner, depth + 1)
+                described = merged
+            else:
+                described = shape(items[0], depth + 1)
+        return {"type": "list", "count": len(items), "items": described}
+    return f"{type(value).__name__}"
+
 
 # --------------------------------------------------------- normalisation
 #
