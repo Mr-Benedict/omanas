@@ -3,7 +3,7 @@
 Your Synology NAS in the Omarchy bar — health, storage, live resources, recent
 logs, and one-click mounting of shared folders.
 
-> **Status: early development.** Not yet ready to install.
+![Omanas in the Omarchy bar: health and storage, mounting a share, and unlocking an encrypted one](preview.png)
 
 ## What it does
 
@@ -16,6 +16,44 @@ when you log in:
 - **Logs** — the most recent system log entries
 - **Shared folders** — list every share, mount it locally, unlock it if it is
   encrypted
+
+## Install
+
+```bash
+git clone https://github.com/Mr-Benedict/omanas.git \
+  ~/.config/omarchy/plugins/io.github.mr-benedict.omanas
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.mr-benedict.omanas --section right
+```
+
+A NAS icon appears in the bar. Click it, and the panel asks for your NAS's
+hostname, a DSM account and its password; everything else follows from that.
+
+To update, `git pull` in that directory and run `omarchy restart shell`.
+
+## Removing it
+
+Unmount anything currently mounted, and turn off **Keep this share** for any
+folder you persisted, from the panel's *Folders* tab. Both need the plugin
+present, so do them first. Then:
+
+```bash
+omarchy plugin disable io.github.mr-benedict.omanas
+rm -rf ~/.config/omarchy/plugins/io.github.mr-benedict.omanas
+```
+
+That deliberately leaves your credentials and settings alone — uninstalling a
+plugin should not quietly discard them. To remove those too:
+
+```bash
+secret-tool clear service omanas          # DSM password and device token
+rm -rf ~/.config/omanas ~/.cache/omanas   # host, port, pinned certificate
+```
+
+If you removed the plugin before clearing a persisted share, its `/etc/fstab`
+entry is still there. Delete the block between `# >>> omanas managed >>>` and
+`# <<< omanas managed <<<`, and nothing outside it — Omanas never wrote
+anything outside those markers.
 
 ## Requirements
 
@@ -72,8 +110,9 @@ nothing else.
 
 Omanas deliberately does **not** install a polkit rule granting passwordless
 mounts. That would be a permanent privilege grant on your machine for the
-convenience of one plugin. If you want it on a single-user machine, the
-README documents how — it stays your decision, not the installer's.
+convenience of one plugin, and it is not needed: **Keep this share** reaches
+the same place through `/etc/fstab`, one share at a time, revocably, and
+without handing any process a standing right to mount as root.
 
 ## Encrypted shared folders
 
