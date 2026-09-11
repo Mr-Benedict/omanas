@@ -1,0 +1,9 @@
+# Approval on a pull request has to come from an owner listed here, not from
+# any account that can leave a review. Without this file, "one approving
+# review" is satisfied by anyone with access, which on a public repository is
+# not the same thing as the maintainer having looked at it.
+#
+# Add a collaborator by putting their @handle on the line below, next to the
+# existing one. Their approval then counts too.
+
+* @Mr-Benedict
