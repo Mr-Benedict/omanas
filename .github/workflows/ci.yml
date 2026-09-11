@@ -1,0 +1,119 @@
+# Sanity checks for pull requests.
+#
+# Scope is deliberately narrow: run the tests, catch the errors a linter sees
+# that tests cannot, and check that the things the shell reads still parse.
+# Nothing here enforces a house style, because a first contribution should not
+# fail on line length.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Nothing here writes anything back.
+permissions:
+  contents: read
+
+# A new push to a PR makes the previous run irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the floor: bin/omanas-mount uses a backslash inside an
+        # f-string expression, which is a syntax error before it.
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Check the helpers parse on this Python
+        run: |
+          python -m py_compile bin/omanas bin/omanas-mount
+
+      - name: Run the suite
+        # -W error::DeprecationWarning so a deprecation that will break a
+        # later Python fails here rather than on a user's machine. The suite
+        # is standard library only, so there is nothing to install.
+        run: |
+          python -W error::DeprecationWarning -m unittest discover -s tests -v
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Errors only, no style
+        # F821 in particular: an undefined name on a path no test reaches.
+        # That exact bug shipped once, in the redaction helper `diagnostics`
+        # calls at the very end of a round trip to the NAS.
+        run: ruff check --output-format=github .
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Needs the PR's commits, not just the merge result, to read their
+          # messages. 0 is the whole history; fetch-depth alone cannot express
+          # "the commits this PR adds".
+          fetch-depth: 0
+
+      - name: No credentials in the tree
+        # The plugin's whole design is that secrets live in the keyring. A
+        # key or a credentials file committed by accident contradicts that
+        # loudly enough to be worth one grep.
+        run: |
+          if git grep -nIE 'BEGIN (RSA|OPENSSH|EC|DSA|PGP) PRIVATE KEY' -- . ; then
+            echo "::error::A private key is committed."
+            exit 1
+          fi
+          if git ls-files | grep -E '(^|/)(creds-|\.env$|secrets?\.json$)'; then
+            echo "::error::A credentials file is committed."
+            exit 1
+          fi
+
+      - name: No assistant co-author trailers
+        # This project's history is attributed to the people who wrote it.
+        # Tooling that appends its own Co-Authored-By or session link should
+        # have that turned off rather than merged.
+        if: github.event_name == 'pull_request'
+        run: |
+          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          if git log --format='%B' "$range" | grep -niE '^(co-authored-by:.*(claude|copilot|chatgpt|cursor|devin)|.*-session: *https?://)'; then
+            echo "::error::Remove the assistant trailers from your commit messages, then force-push."
+            exit 1
+          fi
+
+      - name: The helpers stay executable
+        # pkexec and the panel both run them directly; a lost mode bit is a
+        # plugin that does nothing with no visible reason.
+        run: |
+          for helper in bin/omanas bin/omanas-mount; do
+            mode=$(git ls-files -s "$helper" | cut -d' ' -f1)
+            if [ "$mode" != "100755" ]; then
+              echo "::error::$helper is $mode, should be 100755. Run: git update-index --chmod=+x $helper"
+              exit 1
+            fi
+          done

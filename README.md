@@ -97,6 +97,34 @@ plugin directory. While developing through a symlink, `omarchy restart shell`
 is what actually picks up a change; a `rescanPlugins` will appear to succeed
 while the old code keeps running.
 
+### Tests
+
+Standard library only, so there is nothing to install:
+
+```bash
+python3 -m unittest discover -s tests          # everything
+python3 tests/test_dsm_client.py               # one file, verbosely
+```
+
+Nothing in the suite touches a network, a keyring or `/etc/fstab`; the
+transport is faked and the paths are redirected into a scratch directory, so
+it is safe to run on a machine with a working install.
+
+Python 3.12 or newer. The floor is `bin/omanas-mount`, which puts a backslash
+inside an f-string expression — a syntax error before 3.12.
+
+### What CI checks on a pull request
+
+- The suite, on Python 3.12 and 3.13, with deprecation warnings fatal.
+- `ruff check` — errors only (undefined names, unused imports), no style
+  rules. An undefined name on a path no test reaches is the one class of bug
+  the suite genuinely cannot see.
+- That no credential file or private key is committed, that the two helpers
+  keep their executable bit, and that commit messages carry no assistant
+  co-author trailers.
+
+Run the first two before opening a PR and there should be no surprises.
+
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
