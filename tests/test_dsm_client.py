@@ -26,8 +26,11 @@ class FakeResponse:
         self.status = status
         self._payload = payload if isinstance(payload, str) else json.dumps(payload)
 
-    def read(self):
-        return self._payload.encode("utf-8")
+    def read(self, limit=None):
+        # The client reads a bounded number of bytes rather than whatever
+        # arrives, so the stand-in has to take the limit too.
+        body = self._payload.encode("utf-8")
+        return body if limit is None else body[:limit]
 
 
 class FakeConnection:

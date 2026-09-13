@@ -16,10 +16,12 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import http.client
 import urllib.error
@@ -35,6 +37,69 @@ APIS_PATH = os.path.join(CACHE_DIR, "apis.json")
 
 KEYRING_SERVICE = "omanas"
 SESSION_NAME = "Omanas"
+
+# --------------------------------------------------------------- tools
+#
+# This process hands the NAS password to secret-tool and to pkexec, so which
+# program answers to those names matters. PATH belongs to whoever started the
+# panel -- a shell, a desktop file, another plugin's environment -- and a
+# directory earlier on it would answer first. Names are resolved here instead,
+# in the directories a distribution actually installs them in.
+TOOL_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+
+def tool(name: str) -> str | None:
+    """An absolute path to a trusted tool, or None if it is not installed."""
+    for directory in TOOL_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+# Every subprocess here gets a deadline. A keyring daemon that never answers
+# or a mount that hangs on an unreachable NAS would otherwise wedge the panel,
+# which has no way to cancel a helper it is waiting on.
+SECRET_TIMEOUT = 10
+MOUNT_TIMEOUT = 60
+UMOUNT_TIMEOUT = 30
+# A polkit dialog waits on a human typing a password, so this one is about a
+# helper that hung rather than about a slow user.
+PKEXEC_TIMEOUT = 300
+
+# Enough of a failing tool's output to diagnose it, and no more: the text ends
+# up in a JSON line the panel renders in a label.
+MAX_OUTPUT_CHARS = 4096
+
+
+def clip(text: str | None) -> str:
+    """Bound what a tool said before it becomes part of an error message."""
+    text = (text or "").strip()
+    return text if len(text) <= MAX_OUTPUT_CHARS else text[:MAX_OUTPUT_CHARS] + "…"
+
+
+def write_private(path: str, text: str) -> None:
+    """Replace a file atomically, readable only by its owner.
+
+    The scratch file used to be path + ".tmp", a name anyone could guess and
+    create first. mkstemp opens an unpredictable one exclusively, and the mode
+    is set on the descriptor before a byte is written rather than after it.
+    """
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+    replaced = False
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
 
 # DSM error codes worth translating. Everything else surfaces as its number,
 # because DSM's own catalogue is inconsistent between APIs.
@@ -74,13 +139,18 @@ COMMON_ERRORS = {
 class DsmError(Exception):
     """A DSM API call came back with success=false."""
 
-    def __init__(self, code: int, api: str = "", method: str = ""):
+    def __init__(self, code: int, api: str = "", method: str = "", message: str = ""):
         self.code = int(code)
         self.api = api
         self.method = method
+        # A failure that DSM's own catalogue has no number for still belongs
+        # in this exception, so the panel keeps its one error shape.
+        self.message = message
         super().__init__(self.describe())
 
     def describe(self) -> str:
+        if self.message:
+            return self.message
         text = (AUTH_ERRORS.get(self.code) or CRYPTO_ERRORS.get(self.code)
                 or COMMON_ERRORS.get(self.code))
         where = f" ({self.api}.{self.method})" if self.api else ""
@@ -124,12 +194,7 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-    tmp = CONFIG_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CONFIG_PATH)
+    write_private(CONFIG_PATH, json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
 # --------------------------------------------------------------- secrets
@@ -150,31 +215,54 @@ def secret_attrs(config: dict, kind: str) -> list[str]:
 
 
 def secret_store(config: dict, kind: str, value: str, label: str) -> None:
-    subprocess.run(
-        ["secret-tool", "store", "--label", label, *secret_attrs(config, kind)],
-        input=value,
-        text=True,
-        check=True,
-    )
+    binary = tool("secret-tool")
+    if binary is None:
+        raise SystemExit("secret-tool is not installed (it comes with libsecret)")
+    try:
+        subprocess.run(
+            [binary, "store", "--label", label, *secret_attrs(config, kind)],
+            input=value,
+            text=True,
+            check=True,
+            timeout=SECRET_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("secret-tool did not answer — is a keyring unlocked?")
 
 
 def secret_lookup(config: dict, kind: str) -> str | None:
-    result = subprocess.run(
-        ["secret-tool", "lookup", *secret_attrs(config, kind)],
-        capture_output=True,
-        text=True,
-    )
+    binary = tool("secret-tool")
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "lookup", *secret_attrs(config, kind)],
+            capture_output=True,
+            text=True,
+            timeout=SECRET_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        # A keyring that never answers holds nothing, as far as every caller
+        # here is concerned: they all fall back to asking for the password.
+        return None
     if result.returncode != 0:
         return None
     return result.stdout or None
 
 
 def secret_clear(config: dict, kind: str) -> None:
-    subprocess.run(
-        ["secret-tool", "clear", *secret_attrs(config, kind)],
-        capture_output=True,
-        text=True,
-    )
+    binary = tool("secret-tool")
+    if binary is None:
+        return
+    try:
+        subprocess.run(
+            [binary, "clear", *secret_attrs(config, kind)],
+            capture_output=True,
+            text=True,
+            timeout=SECRET_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        pass
 
 
 # ------------------------------------------------------------------ DNS
@@ -201,11 +289,8 @@ def _read_dns_cache() -> dict:
 
 def _write_dns_cache(cache: dict) -> None:
     os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-    tmp = DNS_PATH + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle)
-        os.replace(tmp, DNS_PATH)
+        write_private(DNS_PATH, json.dumps(cache))
     except OSError:
         pass
 
@@ -286,6 +371,11 @@ class PinnedContext:
 
 
 # ------------------------------------------------------------------ DSM
+#
+# DSM's largest answer here is the API map, a few hundred kilobytes. The cap
+# is what stops a hostile or broken NAS -- or something on the port that is
+# not a NAS at all -- from making this process allocate until it is killed.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class Dsm:
@@ -367,7 +457,9 @@ class Dsm:
                 conn = self._connect()
                 conn.request("POST" if body is not None else "GET", target, body, headers)
                 response = conn.getresponse()
-                payload = response.read().decode("utf-8", "replace")
+                # One byte past the cap, so an oversized body is recognised
+                # rather than silently truncated into half a JSON document.
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
             except ssl.SSLError as exc:
                 self._close()
                 raise SystemExit(describe_tls_failure(exc, self.port))
@@ -385,6 +477,14 @@ class Dsm:
                         f"Port {self.port} answered with something that is not HTTP. "
                         "It is probably DSM's HTTPS port — turn HTTPS on.")
                 raise SystemExit(f"Cannot reach {self.host}:{self.port} — {exc}")
+
+            if len(raw) > MAX_RESPONSE_BYTES:
+                self._close()
+                raise DsmError(100, message=(
+                    f"{self.host} sent more than "
+                    f"{MAX_RESPONSE_BYTES // (1024 * 1024)} MiB in one response, "
+                    "which DSM does not do."))
+            payload = raw.decode("utf-8", "replace")
 
             if response.status != 200:
                 raise SystemExit(f"HTTP {response.status} from {self.host}")
@@ -414,12 +514,10 @@ class Dsm:
 
     def _store_apis(self, apis: dict) -> None:
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-        tmp = APIS_PATH + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump({"host": self.host, "apis": apis,
-                           "expires": time.time() + self.APIS_TTL_SECONDS}, handle)
-            os.replace(tmp, APIS_PATH)
+            write_private(APIS_PATH, json.dumps(
+                {"host": self.host, "apis": apis,
+                 "expires": time.time() + self.APIS_TTL_SECONDS}))
         except OSError:
             pass
 
@@ -507,22 +605,15 @@ class Dsm:
 
     def save_session(self) -> None:
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-        tmp = SESSION_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "host": self.host,
-                    "account": self.username,
-                    "sid": self.sid,
-                    # DSM's own default session lifetime is longer, but a
-                    # short local expiry costs one cheap re-login and keeps a
-                    # stale sid from silently failing every later call.
-                    "expires": time.time() + 3600,
-                },
-                handle,
-            )
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, SESSION_PATH)
+        write_private(SESSION_PATH, json.dumps({
+            "host": self.host,
+            "account": self.username,
+            "sid": self.sid,
+            # DSM's own default session lifetime is longer, but a short local
+            # expiry costs one cheap re-login and keeps a stale sid from
+            # silently failing every later call.
+            "expires": time.time() + 3600,
+        }))
 
     def login(self, otp: str | None = None, force: bool = False,
               password: str | None = None) -> dict:
@@ -1103,24 +1194,60 @@ def cmd_diagnostics(args) -> int:
 MOUNT_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "omanas-mount")
 
 
-def mount_target(config: dict, mount_root: str, share: str) -> str:
-    root = os.path.expanduser(mount_root or "~/mnt/nas")
-    return os.path.join(root, share)
+# Shares mount under a chain of root-owned directories rather than anywhere in
+# the user's home. Nothing on the path can then be swapped for a symlink
+# between the root helper checking it and mounting on it, and the path is
+# derived from the account name on both sides rather than named by the caller.
+MOUNT_BASE = "/mnt/omanas"
+
+
+def mount_target(share: str) -> str:
+    """Where the helper mounts a share. Derived, never chosen by the caller."""
+    return os.path.join(MOUNT_BASE, pwd.getpwuid(os.getuid()).pw_name, share)
+
+
+def link_mount_root(mount_root: str) -> None:
+    """Point the configured mount root at the real one, so shares stay where
+    the README says they are.
+
+    Unprivileged, and it never clobbers: an existing directory, or a link
+    pointing somewhere else, is left exactly alone. Every failure is swallowed
+    -- this is a convenience, and a mount that worked must not be reported as
+    failed because a shortcut could not be made.
+    """
+    try:
+        path = os.path.expanduser(mount_root or "~/mnt/nas")
+        if os.path.lexists(path):
+            return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.symlink(os.path.join(MOUNT_BASE, pwd.getpwuid(os.getuid()).pw_name), path)
+    except (OSError, KeyError):
+        pass
 
 
 def run_privileged(arguments: list[str], password: str | None) -> dict:
     """Call the root helper through pkexec, feeding the password on stdin."""
     if not os.path.exists(MOUNT_HELPER):
         return {"ok": False, "error": f"Mount helper missing at {MOUNT_HELPER}"}
+    pkexec = tool("pkexec")
+    if pkexec is None:
+        return {"ok": False, "error": "pkexec is not installed"}
     try:
         result = subprocess.run(
-            ["pkexec", MOUNT_HELPER, *arguments],
+            [pkexec, MOUNT_HELPER, *arguments],
             input=(password + "\n") if password is not None else "",
             capture_output=True,
             text=True,
+            timeout=PKEXEC_TIMEOUT,
         )
     except FileNotFoundError:
         return {"ok": False, "error": "pkexec is not installed"}
+    except subprocess.TimeoutExpired:
+        # Long enough that this is the helper stuck on an unreachable NAS
+        # rather than someone still reading the polkit dialog.
+        return {"ok": False, "error": "The mount helper did not finish in time"}
     if result.stdout.strip():
         try:
             return json.loads(result.stdout.strip().splitlines()[-1])
@@ -1131,7 +1258,7 @@ def run_privileged(arguments: list[str], password: str | None) -> dict:
         return {"ok": False, "cancelled": True, "error": "Authentication cancelled"}
     if result.returncode == 127:
         return {"ok": False, "error": "pkexec could not run the mount helper"}
-    detail = (result.stderr or "").strip().splitlines()
+    detail = clip(result.stderr).splitlines()
     return {"ok": False, "error": detail[-1] if detail else "Mount helper failed"}
 
 
@@ -1141,12 +1268,10 @@ def cmd_mount(args) -> int:
     if not password:
         print(json.dumps({"ok": False, "error": "No password in the keyring"}))
         return 1
-    target = mount_target(config, args.mount_root, args.share)
     arguments = [
         "persist" if args.persist else "mount",
         "--host", config["host"],
         "--share", args.share,
-        "--mountpoint", target,
         "--account", config["username"],
     ]
     if args.read_only:
@@ -1156,34 +1281,51 @@ def cmd_mount(args) -> int:
     # A persisted share is only recorded by 'persist'; mounting it is still a
     # separate step, and one that now needs no password at all.
     if result.get("ok") and args.persist:
-        mount = subprocess.run(["mount", target], capture_output=True, text=True)
-        if mount.returncode != 0:
-            result["mountError"] = (mount.stderr or mount.stdout).strip()
+        target = str(result.get("mountpoint") or mount_target(args.share))
+        binary = tool("mount")
+        if binary is None:
+            result["mountError"] = "mount is not installed"
         else:
-            result["mounted"] = True
+            try:
+                mount = subprocess.run([binary, target], capture_output=True,
+                                       text=True, timeout=MOUNT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                result["mountError"] = f"Mounting {args.share} took too long"
+            else:
+                if mount.returncode != 0:
+                    result["mountError"] = clip(mount.stderr or mount.stdout)
+                else:
+                    result["mounted"] = True
+
+    # The configured mount root is now a shortcut rather than the place shares
+    # land, so it is made after the fact and only if it costs nothing.
+    if result.get("ok"):
+        link_mount_root(args.mount_root)
 
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
 
 
 def cmd_unmount(args) -> int:
-    config = load_config()
-    target = mount_target(config, args.mount_root, args.share)
     # An fstab-persisted share carries the 'user' option, so the owner can
     # unmount it without any privilege at all. Try that before asking polkit.
-    plain = subprocess.run(["umount", target], capture_output=True, text=True)
-    if plain.returncode == 0:
-        print(json.dumps({"ok": True, "elevated": False}))
-        return 0
-    result = run_privileged(["unmount", "--mountpoint", target], None)
+    binary = tool("umount")
+    if binary is not None:
+        try:
+            plain = subprocess.run([binary, mount_target(args.share)],
+                                   capture_output=True, text=True, timeout=UMOUNT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            plain = None
+        if plain is not None and plain.returncode == 0:
+            print(json.dumps({"ok": True, "elevated": False}))
+            return 0
+    result = run_privileged(["unmount", "--share", args.share], None)
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
 
 
 def cmd_forget(args) -> int:
-    config = load_config()
-    target = mount_target(config, args.mount_root, args.share)
-    result = run_privileged(["forget", "--mountpoint", target, "--share", args.share], None)
+    result = run_privileged(["forget", "--share", args.share], None)
     print(json.dumps(result))
     return 0 if result.get("ok") else 1
 
@@ -1400,7 +1542,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     def mount_args(sp):
         sp.add_argument("--share", required=True)
-        sp.add_argument("--mount-root", default="~/mnt/nas")
+        # Shares mount under /mnt/omanas whatever this says; it names the
+        # shortcut that points there. The panel passes it, so it stays.
+        sp.add_argument("--mount-root", default="~/mnt/nas",
+                        help="Where to link the mounted shares from")
 
     mount = sub.add_parser("mount", help="Mount a shared folder locally")
     mount_args(mount)

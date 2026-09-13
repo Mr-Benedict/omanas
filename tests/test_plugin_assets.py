@@ -118,6 +118,14 @@ class Settings(unittest.TestCase):
         self.assertIn("--mount-root", read("bin", "omanas"))
         self.assertIn(self.DEFAULTS["mountRoot"], read("bin", "omanas"))
 
+    def test_the_mount_root_is_described_as_a_shortcut(self):
+        # It stopped being where shares are mounted: the helper derives that
+        # itself, under /mnt/omanas. A label still promising otherwise would
+        # have people typing a path that does nothing.
+        label = self.SCHEMA["mountRoot"]["label"]
+        self.assertIn("/mnt/omanas", label)
+        self.assertIn("/mnt/omanas", read("bin", "omanas"))
+
 
 # A `/` starts a regex literal only where a value may begin. Without this,
 # `replace(/^file:\/\//, "")` reads as a comment and the rest of the line
@@ -251,6 +259,12 @@ class Scripts(unittest.TestCase):
                     continue
                 with self.subTest(name=name, module=module):
                     self.assertIn(root, allowed, module)
+
+    def test_the_client_never_names_a_mountpoint(self):
+        # The root helper derives the path from the account it is mounting
+        # for. A client that could name one would reopen the race that
+        # moving the mounts out of the user's home closed.
+        self.assertNotIn("--mountpoint", read("bin", "omanas"))
 
     def test_the_version_the_helper_reports_matches_the_manifest(self):
         self.assertIn(f'"omanas": "{MANIFEST["version"]}"', read("bin", "omanas"))
