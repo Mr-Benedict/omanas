@@ -5,31 +5,78 @@ Invoked through pkexec by the plugin. Everything it is asked to do is
 validated here rather than trusted from the caller, because the caller is
 unprivileged QML and this is not.
 
-Three rules shape the whole file:
+The rules that shape the file are each the answer to a way an unprivileged
+process running as the calling user could otherwise steer root:
 
+  * The caller never names a path. A request names a share; the helper
+    derives /mnt/omanas/<user>/<share> from it. A path the caller chooses is
+    a path the caller can replace with a symlink to /etc between the moment
+    it is checked and the moment root uses it.
+  * Every component of that path -- and of /etc/omanas and /run/omanas -- is
+    opened one at a time with O_NOFOLLOW and required to be owned by the
+    identity we run as and writable by nobody else. What is used afterwards
+    is the descriptor, not the name, so there is no second resolution left
+    for anything to race.
   * The SMB password arrives on stdin and reaches mount.cifs through a 0600
     credentials file. It never becomes an argv element, which /proc would
-    expose to every user on this machine.
+    expose to every user on this machine. The throwaway copy for a one-off
+    mount lives on tmpfs under /run, so the password never touches a disk.
   * The caller's identity comes from PKEXEC_UID, which pkexec sets itself.
     Nothing about who the caller is, is taken from the arguments.
-  * A mountpoint must resolve inside the calling user's home directory. That
-    is what stops a crafted request from mounting a share over /etc.
+  * External tools are run from absolute paths. PATH is never consulted, the
+    run has a deadline, its output is capped, and it gets its own process
+    group, so a hung mount.cifs cannot wedge a root process forever.
+  * /etc/fstab is rewritten as one locked transaction that refuses to commit
+    if the file changed underneath it, and only ever inside the managed block.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
+import hashlib
 import json
 import os
 import pwd
 import re
+import selectors
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 FSTAB = "/etc/fstab"
 BEGIN = "# >>> omanas managed >>>"
 END = "# <<< omanas managed <<<"
+
+# The three path chains this helper is willing to work through. All of them
+# are outside any user's home, so every component can be -- and is required to
+# be -- owned by root. A caller-writable component is a caller-controlled
+# root operation.
+MOUNT_BASE = "/mnt/omanas"      # a share mounts at <base>/<user>/<share>
+STATE_DIR = "/etc/omanas"       # persistent credentials, and the fstab lock
+RUNTIME_DIR = "/run/omanas"     # tmpfs: the one-off credentials file
+
+# Where a chain starts. A constant rather than a literal so the tests can
+# stand a whole sandbox up somewhere they own.
+ROOT = "/"
+
+MOUNTINFO = "/proc/self/mountinfo"
+LOCK_NAME = ".fstab.lock"
+
+# No bare binary names anywhere: a root process must not take a PATH lookup
+# from an environment the caller had a hand in.
+TOOL_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+OUTPUT_LIMIT = 1 << 16          # per stream, per tool run
+FSTAB_LIMIT = 1 << 20           # a plausible /etc/fstab is a few hundred bytes
+LOCK_TIMEOUT = 10.0
+MOUNT_TIMEOUT = 60.0
+UMOUNT_TIMEOUT = 30.0
+FINDMNT_TIMEOUT = 15.0
 
 # Share and host names are pasted into a device string and, for persistent
 # shares, into /etc/fstab. Anything outside these sets could smuggle in a
@@ -57,34 +104,327 @@ def caller() -> pwd.struct_passwd:
         fail("PKEXEC_UID does not name a real user")
 
 
-def checked_mountpoint(user: pwd.struct_passwd, path: str) -> str:
-    """Resolve a mountpoint and refuse anything outside the caller's home.
+# ------------------------------------------------------------------- tools
+#
+# Everything run from here is run by its absolute path, with a deadline and a
+# cap on how much it may say. A tool that hangs -- mount.cifs against a NAS
+# that stopped answering mid-handshake is the everyday case -- must not leave
+# a root process waiting forever, and a tool that floods its output must not
+# be able to grow this process until the machine swaps.
 
-    realpath first, so symlinks cannot walk out of the home directory after
-    the check.
+
+def tool(name: str) -> str:
+    """The absolute path of a helper binary. PATH is never consulted."""
+    for directory in TOOL_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    fail(f"{name} is not installed")
+
+
+class Completed:
+    """What a bounded run produced. Deliberately smaller than CompletedProcess."""
+
+    __slots__ = ("returncode", "stdout", "stderr", "timed_out")
+
+    def __init__(self, returncode: int, stdout: str, stderr: str, timed_out: bool):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+
+
+def stop(proc: subprocess.Popen) -> None:
+    """Tear down a run that outlived its deadline, children included.
+
+    mount.cifs forks; signalling the process alone would leave whatever it
+    started still holding the mount point. start_new_session gave the run its
+    own process group precisely so the whole group can be taken down here.
     """
-    resolved = os.path.realpath(os.path.expanduser(path))
-    home = os.path.realpath(user.pw_dir)
-    if resolved != home and not resolved.startswith(home + os.sep):
-        fail(f"Refusing to mount outside {home}")
-    if resolved == home:
-        fail("Refusing to mount over the home directory itself")
-    return resolved
+    try:
+        group = os.getpgid(proc.pid)
+    except OSError:
+        group = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None:
+            return
+        if group is not None:
+            try:
+                os.killpg(group, sig)
+            except OSError:
+                pass
+        else:
+            try:
+                proc.send_signal(sig)
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2.0)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
-def ensure_dir(user: pwd.struct_passwd, path: str) -> None:
-    if os.path.ismount(path):
-        fail("Already mounted")
-    if os.path.isdir(path):
-        if os.listdir(path):
-            fail("Mount point is not empty")
-        return
-    if os.path.exists(path):
-        fail("Mount point exists and is not a directory")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    # The directory belongs to the user, not to root, so they can still remove
-    # it once the share is unmounted.
-    os.chown(path, user.pw_uid, user.pw_gid)
+def run_tool(argv: list[str], timeout: float) -> Completed:
+    """Run a tool with no stdin, bounded output and a wall-clock deadline."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        fail(f"Cannot run {argv[0]}: {error.strerror}")
+
+    deadline = time.monotonic() + timeout
+    collected = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    timed_out = False
+    selector = selectors.DefaultSelector()
+    try:
+        for stream in collected:
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            for key, _ in selector.select(timeout=min(remaining, 0.25)):
+                stream = key.fileobj
+                try:
+                    block = os.read(stream.fileno(), 65536)
+                except (BlockingIOError, InterruptedError):
+                    continue
+                except OSError:
+                    block = b""
+                if not block:
+                    selector.unregister(stream)
+                    continue
+                # Keep reading past the cap but stop storing: a full pipe
+                # would stall the child and turn a chatty tool into a timeout.
+                buffered = collected[stream]
+                if len(buffered) < OUTPUT_LIMIT:
+                    buffered += block[:OUTPUT_LIMIT - len(buffered)]
+        if not timed_out:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+    finally:
+        selector.close()
+        if timed_out:
+            stop(proc)
+        for stream in collected:
+            try:
+                stream.close()
+            except OSError:
+                pass
+        returncode = proc.wait()
+
+    return Completed(
+        returncode,
+        bytes(collected[proc.stdout]).decode("utf-8", "replace"),
+        bytes(collected[proc.stderr]).decode("utf-8", "replace"),
+        timed_out,
+    )
+
+
+def detail_of(result: Completed, fallback: str) -> str:
+    lines = (result.stderr or result.stdout or "").strip().splitlines()
+    return lines[-1] if lines else fallback
+
+
+# ------------------------------------------------------- paths, by descriptor
+#
+# The rule is that a name is resolved exactly once, under our control, and
+# everything afterwards happens through the descriptor that resolution
+# produced. Checking a path and then passing the string to mkdir, mount and
+# rmdir asks the kernel to resolve it three more times, and a caller who owns
+# any component can change what it means in between.
+
+
+def require_own_dir(fd: int, label: str) -> None:
+    """A directory we are willing to work through: ours, and only ours."""
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        fail(f"Refusing to use {label}: it is not a directory")
+    # geteuid rather than a literal 0: the invariant is "owned by the identity
+    # we are running as", which is what makes the check meaningful under test
+    # as well as under pkexec.
+    if info.st_uid != os.geteuid():
+        fail(f"Refusing to use {label}: it is not owned by root")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        fail(f"Refusing to use {label}: other users can write to it")
+
+
+def describe(parent_fd: int, name: str) -> str:
+    """What is sitting where a directory of ours should be, for the message."""
+    try:
+        info = os.lstat(name, dir_fd=parent_fd)
+    except OSError:
+        return "not a directory"
+    return "a symbolic link" if stat.S_ISLNK(info.st_mode) else "not a directory"
+
+
+def descend(parent_fd: int, name: str, mode: int | None) -> int:
+    """Open one path component with O_NOFOLLOW, creating it if asked."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        if error.errno == errno.ENOENT and mode is not None:
+            try:
+                os.mkdir(name, mode, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            except OSError as failure:
+                fail(f"Cannot create {name}: {failure.strerror}")
+            try:
+                fd = os.open(name, flags, dir_fd=parent_fd)
+            except OSError as failure:
+                fail(f"Cannot open {name}: {failure.strerror}")
+            try:
+                # mkdir's mode goes through the umask, which is inherited from
+                # whoever launched us. Set it explicitly so a loose umask
+                # cannot leave a directory on this chain group-writable -- but
+                # through the descriptor just opened with O_NOFOLLOW, because
+                # os.chmod on a name follows a symlink, and the name is exactly
+                # what something racing the mkdir above would have replaced.
+                os.fchmod(fd, mode)
+            except OSError as failure:
+                os.close(fd)
+                fail(f"Cannot set the mode of {name}: {failure.strerror}")
+        elif error.errno in (errno.ELOOP, errno.ENOTDIR):
+            # Both mean "this is not a directory we may open". Linux answers
+            # ENOTDIR rather than ELOOP when O_NOFOLLOW and O_DIRECTORY meet a
+            # symlink, so the two cases are told apart by asking. Only the
+            # wording depends on the answer; either way we refuse.
+            fail(f"Refusing to use {name}: it is {describe(parent_fd, name)}")
+        else:
+            fail(f"Cannot open {name}: {error.strerror}")
+    require_own_dir(fd, name)
+    return fd
+
+
+def open_chain(path: str, mode: int) -> int:
+    """Open an absolute directory a component at a time, checking each one."""
+    if not path.startswith(ROOT):
+        fail(f"Refusing to use {path}: it is outside {ROOT}")
+    fd = os.open(ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    require_own_dir(fd, ROOT)
+    for name in path[len(ROOT):].strip("/").split("/"):
+        if not name:
+            continue
+        if name in (".", ".."):
+            fail(f"Refusing to use {path}: it is not a plain path")
+        try:
+            child = descend(fd, name, mode)
+        finally:
+            os.close(fd)
+        fd = child
+    return fd
+
+
+class Mountpoint:
+    """A share directory that has been opened and checked, and stays open.
+
+    Everything after the check goes through the descriptor, so there is no
+    second pathname resolution for anything to race.
+    """
+
+    def __init__(self, parent_fd: int, name: str, fd: int, path: str):
+        self.parent_fd = parent_fd
+        self.name = name
+        self.fd = fd
+        self.path = path
+
+    def close(self) -> None:
+        for fd in (self.fd, self.parent_fd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.fd = -1
+        self.parent_fd = -1
+
+    def remove(self) -> None:
+        """Take the empty directory back, by name relative to its own parent."""
+        try:
+            os.rmdir(self.name, dir_fd=self.parent_fd)
+        except OSError:
+            pass
+
+
+def mountpoint_path(user: pwd.struct_passwd, share: str) -> str:
+    """Where a share belongs. Derived here, never supplied by the caller."""
+    if not USER_RE.match(user.pw_name) or "/" in user.pw_name:
+        fail("Refusing to build a mount point from that account name")
+    if not SHARE_RE.match(share):
+        fail("Invalid share name")
+    return os.path.join(MOUNT_BASE, user.pw_name, share)
+
+
+def mountpoint_for(user: pwd.struct_passwd, share: str) -> Mountpoint:
+    """Open /mnt/omanas/<user>/<share>, creating and checking every step."""
+    path = mountpoint_path(user, share)
+    base_fd = open_chain(MOUNT_BASE, 0o755)
+    try:
+        user_fd = descend(base_fd, user.pw_name, 0o755)
+    finally:
+        os.close(base_fd)
+    try:
+        share_fd = descend(user_fd, share, 0o755)
+    except BaseException:
+        os.close(user_fd)
+        raise
+    return Mountpoint(user_fd, share, share_fd, path)
+
+
+# ------------------------------------------------------------- mount table
+#
+# /proc/self/mountinfo rather than os.path.ismount: ismount compares st_dev
+# against the parent, which is a guess, and it resolves the path all over
+# again. mountinfo states what the kernel actually has mounted, and where.
+
+
+def unescape(field: str) -> str:
+    """Undo mountinfo's octal escapes (\\040 for a space, and friends)."""
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), field)
+
+
+def mount_table() -> list[tuple[str, str, str]]:
+    """Every current mount as (mountpoint, fstype, source)."""
+    try:
+        with open(MOUNTINFO, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError as error:
+        fail(f"Cannot read {MOUNTINFO}: {error.strerror}")
+
+    entries = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 10:
+            continue
+        try:
+            # A variable number of optional fields sits between the mount
+            # options and the single "-" that ends them, so the separator has
+            # to be found rather than indexed. It never appears before field 6.
+            separator = fields.index("-", 6)
+        except ValueError:
+            continue
+        if len(fields) < separator + 3:
+            continue
+        entries.append((unescape(fields[4]),
+                        fields[separator + 1],
+                        unescape(fields[separator + 2])))
+    return entries
+
+
+def mounted_at(path: str) -> bool:
+    return any(mountpoint == path for mountpoint, _, _ in mount_table())
 
 
 def mount_options(user: pwd.struct_passwd, extra_ro: bool) -> str:
@@ -105,71 +445,53 @@ def mount_options(user: pwd.struct_passwd, extra_ro: bool) -> str:
     return ",".join(options)
 
 
-def cmd_mount(args) -> int:
-    user = caller()
-    if not HOST_RE.match(args.host):
-        fail("Invalid host")
-    if not SHARE_RE.match(args.share):
-        fail("Invalid share name")
-    if not USER_RE.match(args.account):
-        fail("Invalid account name")
+# ------------------------------------------------------------ credentials
 
-    target = checked_mountpoint(user, args.mountpoint)
-    password = sys.stdin.readline().rstrip("\n")
-    if not password:
-        fail("No password on stdin")
 
-    ensure_dir(user, target)
+def credentials_name(user: pwd.struct_passwd, share: str) -> str:
+    """A single, space-free component naming this user's file for this share.
 
-    # mount.cifs reads the credentials file itself, so the password never
-    # appears in this process's argv or in the mount table.
-    handle, credentials = tempfile.mkstemp(prefix="omanas-", dir="/run")
+    Share names may contain spaces, and a space in the path would end the
+    credentials= option early and hand the rest of it to mount as something
+    else. The readable part is only for a human reading /etc/omanas; the
+    digest is what keeps two shares apart.
+    """
+    readable = re.sub(r"[^A-Za-z0-9._-]", "_", share)
+    digest = hashlib.sha256(share.encode("utf-8")).hexdigest()[:8]
+    return f"{user.pw_name}.{readable}.{digest}"
+
+
+def write_credentials(dir_fd: int, name: str, account: str, password: str) -> bool:
+    """Create the credentials file inside an already-verified directory.
+
+    O_NOFOLLOW plus a parent nobody but root can write to is the whole
+    defence: the old version opened a path under the caller's home, where a
+    symlink at that name aimed root's O_CREAT|O_TRUNC wherever it liked.
+
+    Answers whether the file had to be created. A caller rolling a failed
+    persist back may only take away a file this run made; one that was
+    already there is referred to by an fstab entry that is already committed.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        with os.fdopen(handle, "w") as stream:
-            os.chmod(credentials, 0o600)
-            stream.write(f"username={args.account}\npassword={password}\n")
-        result = subprocess.run(
-            [
-                "mount", "-t", "cifs",
-                f"//{args.host}/{args.share}", target,
-                "-o", f"credentials={credentials}," + mount_options(user, args.read_only),
-            ],
-            capture_output=True,
-            text=True,
-        )
-    finally:
+        fd = os.open(name, flags | os.O_EXCL, 0o600, dir_fd=dir_fd)
+        created = True
+    except FileExistsError:
+        # Whether something is already there is answered by trying to create
+        # it rather than by looking first: a stat and then an open is the
+        # check-a-name-then-use-the-name shape the rest of this file exists to
+        # avoid. O_NOFOLLOW is on both opens, which is the part that matters --
+        # a symlink at this name still refuses here rather than being followed.
         try:
-            os.remove(credentials)
-        except OSError:
-            pass
-
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        try:
-            os.rmdir(target)
-        except OSError:
-            pass
-        fail(detail[-1] if detail else f"mount failed with status {result.returncode}")
-
-    print(json.dumps({"ok": True, "mountpoint": target}))
-    return 0
-
-
-def cmd_unmount(args) -> int:
-    user = caller()
-    target = checked_mountpoint(user, args.mountpoint)
-    if not os.path.ismount(target):
-        fail("Not mounted")
-    result = subprocess.run(["umount", target], capture_output=True, text=True)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        fail(detail[-1] if detail else "umount failed")
-    try:
-        os.rmdir(target)
-    except OSError:
-        pass
-    print(json.dumps({"ok": True}))
-    return 0
+            fd = os.open(name, flags | os.O_TRUNC, 0o600, dir_fd=dir_fd)
+        except OSError as error:
+            fail(f"Cannot write the credentials file: {error.strerror}")
+        created = False
+    except OSError as error:
+        fail(f"Cannot write the credentials file: {error.strerror}")
+    with os.fdopen(fd, "w") as stream:
+        stream.write(f"username={account}\npassword={password}\n")
+    return created
 
 
 # ------------------------------------------------------------------ fstab
@@ -185,34 +507,24 @@ def entry_target(line: str) -> str:
     return fields[1].replace("\\040", " ") if len(fields) > 1 else ""
 
 
-def ensure_dir_exists(user: pwd.struct_passwd, path: str) -> None:
-    """Create a mount point if missing, tolerating one that is already in use."""
-    if os.path.isdir(path):
-        return
-    if os.path.exists(path):
-        fail("Mount point exists and is not a directory")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    os.chown(path, user.pw_uid, user.pw_gid)
-
-
-def read_fstab() -> tuple[list[str], list[str]]:
-    with open(FSTAB, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
+def parse_fstab(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Split a file into what is ours and what is not. Pure text, no I/O."""
     if BEGIN not in lines or END not in lines:
-        return lines, []
+        return list(lines), []
     start, stop = lines.index(BEGIN), lines.index(END)
     before = lines[:start]
     # The blank line ahead of the block is ours, not the user's. Returning it
-    # as foreign content would hand it back to write_fstab to be preserved,
+    # as foreign content would hand it back to render_fstab to be preserved,
     # and the file would gain a blank line on every cycle.
     while before and not before[-1].strip():
         before.pop()
     return before + lines[stop + 1:], lines[start + 1:stop]
 
 
-def write_fstab(outside: list[str], managed: list[str]) -> None:
+def render_fstab(outside: list[str], managed: list[str]) -> str:
+    """The text to write. Pure, so the risky part can be tested without root."""
     body = list(outside)
-    # read_fstab hands back the blank line that separated the managed block,
+    # parse_fstab hands back the blank line that separated the managed block,
     # so trim trailing blanks before adding another. Otherwise every
     # persist/forget cycle leaves one more blank line behind in /etc/fstab.
     while body and not body[-1].strip():
@@ -221,14 +533,169 @@ def write_fstab(outside: list[str], managed: list[str]) -> None:
         if body:
             body.append("")
         body += [BEGIN, *managed, END]
-    text = "\n".join(body).rstrip("\n") + "\n"
+    return "\n".join(body).rstrip("\n") + "\n"
 
-    directory = os.path.dirname(FSTAB)
-    handle, tmp = tempfile.mkstemp(prefix=".omanas-fstab-", dir=directory)
+
+def read_bounded(fd: int, limit: int, label: str) -> bytes:
+    chunks = bytearray()
+    while True:
+        block = os.read(fd, 65536)
+        if not block:
+            return bytes(chunks)
+        chunks += block
+        if len(chunks) > limit:
+            fail(f"Refusing to read {label}: it is larger than {limit} bytes")
+
+
+def read_fstab_file(required: bool = True) -> tuple[bytes, tuple] | None:
+    """Read /etc/fstab, and remember exactly which file it was.
+
+    required=False turns every reason the file cannot be read into None
+    instead of an exit, for the callers that are only asking what is in it.
+    A machine with no readable /etc/fstab has no managed entry either, which
+    is a fine answer to that question and no reason to refuse an unmount.
+    """
     try:
-        with os.fdopen(handle, "w") as stream:
-            stream.write(text)
-        os.chmod(tmp, 0o644)
+        fd = os.open(FSTAB, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        if not required:
+            return None
+        fail(f"Cannot read {FSTAB}: {error.strerror}")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            if not required:
+                return None
+            fail(f"Refusing to use {FSTAB}: it is not a regular file")
+        if info.st_size > FSTAB_LIMIT:
+            if not required:
+                return None
+            fail(f"Refusing to use {FSTAB}: it is larger than {FSTAB_LIMIT} bytes")
+        data = read_bounded(fd, FSTAB_LIMIT, FSTAB)
+        return data, (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    finally:
+        os.close(fd)
+
+
+def is_persisted(target: str) -> bool:
+    """Does a managed fstab entry still name this mount point?
+
+    A persisted share's directory has to survive an unmount. The parent is
+    root-owned, so a user who lost it could not put it back, and the entry
+    would go on naming a path that no longer exists.
+
+    No lock, for the same reason cmd_list takes none: every commit lands by
+    os.replace, so the worst this can read is the whole file from a moment ago.
+    """
+    found = read_fstab_file(required=False)
+    if found is None:
+        return False
+    _, managed = parse_fstab(found[0].decode("utf-8", "replace").splitlines())
+    return any(entry_target(line) == target for line in managed)
+
+def fsync_dir(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+class Fstab:
+    """One locked read-modify-write of /etc/fstab.
+
+    Two shares persisted at the same moment used to be two processes reading
+    the same file and each writing its own idea of the result back; the second
+    one silently dropped the first one's entry. The lock serialises them, and
+    the identity check refuses to commit at all if the file moved under us
+    while findmnt was running.
+    """
+
+    def __init__(self):
+        self.lock_fd = -1
+        self.identity = None
+        self.data = b""
+        self.outside: list[str] = []
+        self.managed: list[str] = []
+        self.tmp = None
+
+    def __enter__(self) -> Fstab:
+        state_fd = open_chain(STATE_DIR, 0o700)
+        try:
+            self.lock_fd = os.open(
+                LOCK_NAME,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=state_fd,
+            )
+        except OSError as error:
+            fail(f"Cannot take the fstab lock: {error.strerror}")
+        finally:
+            os.close(state_fd)
+
+        # LOCK_NB in a loop rather than a blocking flock: a blocking one has
+        # no deadline, and a root process that waits forever on a lock some
+        # other process is holding is its own denial of service.
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self.release()
+                    fail("Another change to /etc/fstab is still in progress")
+                time.sleep(0.05)
+
+        self.data, self.identity = read_fstab_file()
+        self.outside, self.managed = parse_fstab(
+            self.data.decode("utf-8", "replace").splitlines())
+        return self
+
+    def backup(self) -> None:
+        """Keep the previous file, written from the bytes already in hand.
+
+        Shelling out to cp meant a second resolution of both names and a
+        third process; the content is right here.
+        """
+        path = FSTAB + ".omanas.bak"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(path, flags, 0o644)
+            try:
+                os.write(fd, self.data)
+            finally:
+                os.close(fd)
+        except OSError:
+            # A missing backup is a shame, not a reason to refuse the change.
+            pass
+
+    def unchanged(self) -> bool:
+        try:
+            fd = os.open(FSTAB, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            return False
+        try:
+            info = os.fstat(fd)
+        finally:
+            os.close(fd)
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) == self.identity
+
+    def commit(self) -> None:
+        text = render_fstab(self.outside, self.managed)
+        directory = os.path.dirname(FSTAB) or ROOT
+        handle, self.tmp = tempfile.mkstemp(prefix=".omanas-fstab-", dir=directory)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(self.tmp, 0o644)
+
         # A corrupt fstab is an unbootable machine, so the new file has to
         # parse before it is allowed to replace the real one.
         #
@@ -236,26 +703,48 @@ def write_fstab(outside: list[str], managed: list[str]) -> None:
         # anything it cannot reach right now: a share whose server is offline,
         # a mount point not yet created. None of that means the file is bad.
         # A parse error does, so that is the only thing treated as fatal.
-        check = subprocess.run(["findmnt", "--verify", "--tab-file", tmp],
-                               capture_output=True, text=True)
+        check = run_tool([tool("findmnt"), "--verify", "--tab-file", self.tmp],
+                         FINDMNT_TIMEOUT)
+        if check.timed_out:
+            fail("Refusing to write fstab: findmnt did not finish")
         # Both streams, not whichever is non-empty: findmnt prints the tree it
         # verified on stdout and the parse-error summary on stderr. Reading
         # only stdout -- which is never empty -- meant this guard never fired.
-        report = (check.stdout or "") + (check.stderr or "")
+        report = check.stdout + check.stderr
         parse_errors = re.search(r"(\d+) parse error", report)
         if parse_errors and int(parse_errors.group(1)) > 0:
-            detail = [l for l in report.splitlines() if "parse error" in l]
-            fail("Refusing to write fstab: " + (detail[0].strip() if detail else "malformed entry"))
-        backup = FSTAB + ".omanas.bak"
-        try:
-            subprocess.run(["cp", "-a", FSTAB, backup], check=False)
-        except OSError:
-            pass
-        os.replace(tmp, FSTAB)
-        tmp = None
-    finally:
-        if tmp and os.path.exists(tmp):
-            os.remove(tmp)
+            detail = [line for line in report.splitlines() if "parse error" in line]
+            fail("Refusing to write fstab: "
+                 + (detail[0].strip() if detail else "malformed entry"))
+
+        self.backup()
+        if not self.unchanged():
+            fail("Refusing to write fstab: it changed while omanas was editing it")
+        os.replace(self.tmp, FSTAB)
+        self.tmp = None
+        fsync_dir(directory)
+
+    def release(self) -> None:
+        if self.lock_fd >= 0:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(self.lock_fd)
+            except OSError:
+                pass
+            self.lock_fd = -1
+
+    def __exit__(self, *exc) -> bool:
+        if self.tmp:
+            try:
+                os.remove(self.tmp)
+            except OSError:
+                pass
+            self.tmp = None
+        self.release()
+        return False
 
 
 def fstab_entry(user: pwd.struct_passwd, host: str, share: str, target: str,
@@ -273,56 +762,205 @@ def fstab_entry(user: pwd.struct_passwd, host: str, share: str, target: str,
     return f"//{host}/{share.replace(' ', '\\040')}  {escaped}  cifs  {options}  0 0"
 
 
+# --------------------------------------------------------------- commands
+
+
+def cmd_mount(args) -> int:
+    user = caller()
+    if not HOST_RE.match(args.host):
+        fail("Invalid host")
+    if not SHARE_RE.match(args.share):
+        fail("Invalid share name")
+    if not USER_RE.match(args.account):
+        fail("Invalid account name")
+
+    source = f"//{args.host}/{args.share}"
+    point = mountpoint_for(user, args.share)
+    try:
+        target = point.path
+        if mounted_at(target):
+            fail("Already mounted")
+        # listdir of the descriptor, not of the path: the directory we checked
+        # is the directory we are about to hand to mount.
+        if os.listdir(point.fd):
+            fail("Mount point is not empty")
+
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            if not is_persisted(target):
+                point.remove()
+            fail("No password on stdin")
+
+        # mount.cifs reads the credentials file itself, so the password never
+        # appears in this process's argv or in the mount table. /run is tmpfs,
+        # so the copy never reaches a disk.
+        runtime_fd = open_chain(RUNTIME_DIR, 0o700)
+        os.close(runtime_fd)
+        handle, credentials = tempfile.mkstemp(prefix="omanas-", dir=RUNTIME_DIR)
+        try:
+            with os.fdopen(handle, "w") as stream:
+                stream.write(f"username={args.account}\npassword={password}\n")
+            result = run_tool(
+                [
+                    tool("mount"), "-t", "cifs", source, target,
+                    "-o", f"credentials={credentials}," + mount_options(user, args.read_only),
+                ],
+                MOUNT_TIMEOUT,
+            )
+        finally:
+            try:
+                os.remove(credentials)
+            except OSError:
+                pass
+
+        # A directory a managed fstab entry still names is not ours to take
+        # back: removing it would leave that entry pointing at nothing, and
+        # the user cannot recreate it under a root-owned parent.
+        if result.timed_out:
+            if not is_persisted(target):
+                point.remove()
+            fail(f"mount did not finish within {int(MOUNT_TIMEOUT)} seconds")
+        if result.returncode != 0:
+            message = detail_of(result, f"mount failed with status {result.returncode}")
+            if not is_persisted(target):
+                point.remove()
+            fail(message)
+
+        # mount said yes; the kernel is the one that decides where the share
+        # actually landed. Ask it.
+        table = mount_table()
+        if not any(mountpoint == target and fstype == "cifs"
+                   for mountpoint, fstype, _ in table):
+            strays = [mountpoint for mountpoint, fstype, device in table
+                      if device == source and fstype == "cifs"]
+            for stray in strays:
+                run_tool([tool("umount"), stray], UMOUNT_TIMEOUT)
+            if not is_persisted(target):
+                point.remove()
+            fail(f"Refusing to report success: {source} is not mounted at {target}")
+    finally:
+        point.close()
+
+    print(json.dumps({"ok": True, "mountpoint": point.path}))
+    return 0
+
+
+def cmd_unmount(args) -> int:
+    user = caller()
+    if not SHARE_RE.match(args.share):
+        fail("Invalid share name")
+    point = mountpoint_for(user, args.share)
+    try:
+        if not mounted_at(point.path):
+            fail("Not mounted")
+        result = run_tool([tool("umount"), point.path], UMOUNT_TIMEOUT)
+        if result.timed_out:
+            fail(f"umount did not finish within {int(UMOUNT_TIMEOUT)} seconds")
+        if result.returncode != 0:
+            fail(detail_of(result, "umount failed"))
+        # The mount point outlives the mount when a managed fstab entry still
+        # names it: that entry is what lets the owner mount it again without
+        # pkexec, and the root-owned parent means nobody but root could put a
+        # removed directory back.
+        if not is_persisted(point.path):
+            point.remove()
+    finally:
+        point.close()
+    print(json.dumps({"ok": True}))
+    return 0
+
+
 def cmd_persist(args) -> int:
     user = caller()
     if not HOST_RE.match(args.host) or not SHARE_RE.match(args.share):
         fail("Invalid host or share name")
     if not USER_RE.match(args.account):
         fail("Invalid account name")
-    target = checked_mountpoint(user, args.mountpoint)
-    password = sys.stdin.readline().rstrip("\n")
-    if not password:
-        fail("No password on stdin")
 
-    # A persistent entry needs a persistent credentials file; it lives in the
-    # user's home, readable only by root, and is removed with the entry.
-    credentials = os.path.join(user.pw_dir, ".config", "omanas", f"creds-{args.share}")
-    os.makedirs(os.path.dirname(credentials), mode=0o700, exist_ok=True)
-    os.chown(os.path.dirname(credentials), user.pw_uid, user.pw_gid)
-    with open(os.open(credentials, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as stream:
-        stream.write(f"username={args.account}\npassword={password}\n")
+    # Create the mount point before the fstab entry, so the entry never names
+    # a directory that does not exist yet.
+    point = mountpoint_for(user, args.share)
+    try:
+        target = point.path
+        password = sys.stdin.readline().rstrip("\n")
+        if not password:
+            fail("No password on stdin")
 
-    # Create the mount point before the fstab entry, so the entry never
-    # names a directory that does not exist yet.
-    ensure_dir_exists(user, target)
-    outside, managed = read_fstab()
-    managed = [line for line in managed if entry_target(line) != target]
-    managed.append(fstab_entry(user, args.host, args.share, target, credentials, args.read_only))
-    write_fstab(outside, managed)
-    print(json.dumps({"ok": True, "mountpoint": target, "persistent": True}))
+        # A persistent entry needs a persistent credentials file. It lives in
+        # /etc/omanas, root-owned all the way down, rather than in the user's
+        # home where the user could decide at any moment what that name means.
+        name = credentials_name(user, args.share)
+        credentials = os.path.join(STATE_DIR, name)
+        # The descriptor stays open across the transaction so the cleanup
+        # below unlinks through the directory that was checked, rather than
+        # walking -- and re-resolving -- the chain a second time.
+        state_fd = open_chain(STATE_DIR, 0o700)
+        try:
+            created = write_credentials(state_fd, name, args.account, password)
+            try:
+                with Fstab() as fstab:
+                    fstab.managed = [line for line in fstab.managed
+                                     if entry_target(line) != target]
+                    fstab.managed.append(
+                        fstab_entry(user, args.host, args.share, target,
+                                    credentials, args.read_only))
+                    fstab.commit()
+            except BaseException:
+                # Nothing committed, so nothing refers to a file this run
+                # created: left behind, it would be a copy of the user's SMB
+                # password sitting in /etc/omanas that nothing ever cleans up.
+                # BaseException because fail() leaves by SystemExit, and the
+                # failure itself is re-raised untouched.
+                #
+                # A file that was already here is left alone. It belongs to an
+                # entry an earlier persist committed, which is still in
+                # /etc/fstab because this transaction is the one that failed,
+                # and taking the file away would break a mount that works
+                # today. Its contents are this run's password now, which is as
+                # close to unchanged as a rollback can get.
+                if created:
+                    try:
+                        os.unlink(name, dir_fd=state_fd)
+                    except OSError:
+                        pass
+                raise
+        finally:
+            os.close(state_fd)
+    finally:
+        point.close()
+
+    print(json.dumps({"ok": True, "mountpoint": point.path, "persistent": True}))
     return 0
 
 
 def cmd_forget(args) -> int:
     user = caller()
-    target = checked_mountpoint(user, args.mountpoint)
-    outside, managed = read_fstab()
-    kept = [line for line in managed if entry_target(line) != target]
-    if len(kept) == len(managed):
-        print(json.dumps({"ok": True, "changed": False}))
-        return 0
-    write_fstab(outside, kept)
-    credentials = os.path.join(user.pw_dir, ".config", "omanas", f"creds-{args.share}")
-    try:
-        os.remove(credentials)
-    except OSError:
-        pass
-    print(json.dumps({"ok": True, "changed": True}))
+    target = mountpoint_path(user, args.share)
+    with Fstab() as fstab:
+        kept = [line for line in fstab.managed if entry_target(line) != target]
+        changed = len(kept) != len(fstab.managed)
+        if changed:
+            fstab.managed = kept
+            fstab.commit()
+
+    if changed:
+        state_fd = open_chain(STATE_DIR, 0o700)
+        try:
+            os.unlink(credentials_name(user, args.share), dir_fd=state_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(state_fd)
+
+    print(json.dumps({"ok": True, "changed": changed}))
     return 0
 
 
 def cmd_list(args) -> int:
-    _, managed = read_fstab()
+    # Reporting takes no lock: os.replace makes every commit atomic, so the
+    # worst a reader can see is the whole file from a moment ago.
+    data, _ = read_fstab_file()
+    _, managed = parse_fstab(data.decode("utf-8", "replace").splitlines())
     print(json.dumps({"ok": True, "entries": managed}))
     return 0
 
@@ -334,20 +972,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def shared(sp, need_account=True):
+    def shared(sp):
+        # No --mountpoint: the mount point is derived from the share name, so
+        # there is nothing here for a caller to point somewhere else.
         sp.add_argument("--host", required=True)
         sp.add_argument("--share", required=True)
-        sp.add_argument("--mountpoint", required=True)
-        if need_account:
-            sp.add_argument("--account", required=True)
-            sp.add_argument("--read-only", action="store_true")
+        sp.add_argument("--account", required=True)
+        sp.add_argument("--read-only", action="store_true")
 
     mount = sub.add_parser("mount", help="Mount a share now")
     shared(mount)
     mount.set_defaults(func=cmd_mount)
 
     unmount = sub.add_parser("unmount", help="Unmount a share")
-    unmount.add_argument("--mountpoint", required=True)
+    unmount.add_argument("--share", required=True)
     unmount.set_defaults(func=cmd_unmount)
 
     persist = sub.add_parser("persist", help="Add a managed fstab entry")
@@ -355,7 +993,6 @@ def build_parser() -> argparse.ArgumentParser:
     persist.set_defaults(func=cmd_persist)
 
     forget = sub.add_parser("forget", help="Remove a managed fstab entry")
-    forget.add_argument("--mountpoint", required=True)
     forget.add_argument("--share", required=True)
     forget.set_defaults(func=cmd_forget)
 
