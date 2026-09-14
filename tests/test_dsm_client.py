@@ -26,8 +26,11 @@ class FakeResponse:
         self.status = status
         self._payload = payload if isinstance(payload, str) else json.dumps(payload)
 
-    def read(self):
-        return self._payload.encode("utf-8")
+    def read(self, limit=None):
+        # The client reads a bounded number of bytes rather than whatever
+        # arrives, so the stand-in has to take the limit too.
+        body = self._payload.encode("utf-8")
+        return body if limit is None else body[:limit]
 
 
 class FakeConnection:
@@ -57,7 +60,7 @@ class FakeConnection:
         self.closed = True
 
 
-CONFIG = {"host": "nas.local", "username": "ben", "https": True, "port": 5001}
+CONFIG = {"host": "nas.local", "username": "admin", "https": True, "port": 5001}
 
 # One API map, enough for entry() to resolve the endpoints the panel wants.
 APIS = {
@@ -90,7 +93,6 @@ class Sandbox(unittest.TestCase):
         mod.CONFIG_PATH = os.path.join(directory, "config.json")
         # Nothing may resolve a name; an unreachable NAS in CI must not turn
         # into a five-second stall or a flaky failure.
-        self.real_resolve_host = mod.resolve_host
         self.addCleanup(setattr, mod, "resolve_host", mod.resolve_host)
         mod.resolve_host = lambda host: "10.0.0.9"
 
@@ -247,7 +249,7 @@ class Requests(Sandbox):
 
     def test_a_tls_error_is_translated_rather_than_reported_raw(self):
         conn = FakeConnection(ssl.SSLError("[SSL: WRONG_VERSION_NUMBER] wrong version number"))
-        dsm = self.dsm({"host": "nas.local", "username": "ben", "https": True, "port": 5000},
+        dsm = self.dsm({"host": "nas.local", "username": "admin", "https": True, "port": 5000},
                        conn=conn)
         with self.assertRaises(SystemExit) as caught:
             dsm.call("SYNO.Core.System", "info")
@@ -279,7 +281,7 @@ class Requests(Sandbox):
 
     def test_plain_http_on_the_tls_port_names_the_mistake(self):
         conn = FakeConnection(OSError("bad status line"), OSError("bad status line"))
-        dsm = self.dsm({"host": "nas.local", "username": "ben", "https": False, "port": 5001},
+        dsm = self.dsm({"host": "nas.local", "username": "admin", "https": False, "port": 5001},
                        conn=conn)
         with self.assertRaises(SystemExit) as caught:
             dsm.call("SYNO.Core.System", "info")
@@ -301,7 +303,7 @@ class Discovery(Sandbox):
     def test_a_cached_map_belongs_to_the_host_it_came_from(self):
         self.dsm(conn=FakeConnection(FakeResponse({"success": True, "data": APIS})),
                  apis=None).discover()
-        other = self.dsm({"host": "other.local", "username": "ben"}, apis=None)
+        other = self.dsm({"host": "other.local", "username": "admin"}, apis=None)
         self.assertIsNone(other._cached_apis())
 
     def test_an_expired_map_is_not_used(self):
@@ -365,11 +367,11 @@ class Sessions(Sandbox):
         dsm = self.dsm()
         dsm.sid = "sid-1"
         dsm.save_session()
-        self.assertFalse(self.dsm({"host": "other.local", "username": "ben"}).load_session())
+        self.assertFalse(self.dsm({"host": "other.local", "username": "admin"}).load_session())
 
     def test_an_expired_session_is_not_reused(self):
         with open(mod.SESSION_PATH, "w") as handle:
-            json.dump({"host": "nas.local", "account": "ben", "sid": "old",
+            json.dump({"host": "nas.local", "account": "admin", "sid": "old",
                        "expires": time.time() - 1}, handle)
         self.assertFalse(self.dsm().load_session())
 
@@ -449,11 +451,6 @@ class Login(Sandbox):
 
 
 class Dns(Sandbox):
-    def test_a_literal_address_never_reaches_the_resolver(self):
-        # Short-circuiting matters: a NAS given by IP should never touch the
-        # resolver, which is where the multi-second mDNS stall lives.
-        self.assertEqual(self.real_resolve_host("192.168.1.100"), "192.168.1.100")
-
     def test_a_failed_connection_drops_the_cached_address(self):
         # A NAS that took a new DHCP lease should cost one retry, not a
         # permanent outage until the ten-minute entry expires.

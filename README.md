@@ -48,12 +48,18 @@ plugin should not quietly discard them. To remove those too:
 ```bash
 secret-tool clear service omanas          # DSM password and device token
 rm -rf ~/.config/omanas ~/.cache/omanas   # host, port, pinned certificate
+rm -f ~/mnt/nas                           # the shortcut, if one was made
+sudo rmdir /mnt/omanas/$USER /mnt/omanas  # empty once nothing is mounted
 ```
+
+Turning off **Keep this share** is what removes a share's saved credentials
+from `/etc/omanas`; that is why it comes first.
 
 If you removed the plugin before clearing a persisted share, its `/etc/fstab`
 entry is still there. Delete the block between `# >>> omanas managed >>>` and
 `# <<< omanas managed <<<`, and nothing outside it — Omanas never wrote
-anything outside those markers.
+anything outside those markers. A stale entry also leaves its credentials
+file behind in `/etc/omanas`; the entry names it, so delete that too.
 
 ## Requirements
 
@@ -99,8 +105,11 @@ asked again.
 Mounts are on demand by default. Clicking *Mount* runs a small root helper
 through `pkexec`, so you get Omarchy's polkit dialog; polkit caches that
 authorisation for a few minutes, so mounting several shares in a row asks
-once. Shares land under `~/mnt/nas/<share>` as real kernel CIFS mounts, so
-every application sees them — terminal, editor and file manager alike.
+once. Shares land under `/mnt/omanas/<you>/<share>` as real kernel CIFS
+mounts, so every application sees them — terminal, editor and file manager
+alike. Omanas also drops a symlink at `~/mnt/nas` pointing there, so the
+shares stay one familiar path away; the *Shortcut to mounted shares* setting
+moves it or turns it off.
 
 Flip **Keep this share** and Omanas adds an `/etc/fstab` entry with
 `noauto,user`. That costs one authorisation now and makes every later mount of
@@ -113,6 +122,32 @@ mounts. That would be a permanent privilege grant on your machine for the
 convenience of one plugin, and it is not needed: **Keep this share** reaches
 the same place through `/etc/fstab`, one share at a time, revocably, and
 without handing any process a standing right to mount as root.
+
+### Why shares mount outside your home
+
+Mounting is the one thing here that needs root, so the helper that does it is
+built to distrust its own caller. Everything it touches — `/mnt/omanas`, the
+per-user directory inside it, and `/etc/omanas`, where a persisted share's
+credentials file lives — is owned by root from the top down.
+
+That is not tidiness. If the helper worked inside your home directory, every
+directory on the way to a mountpoint would be one that any process running as
+you can replace between the moment the helper checks a path and the moment
+root acts on it. Checking a *name* and then using that name again is a race,
+and a symlink dropped into the gap is how a plugin that mounts a NAS share
+turns into a way to write a file as root anywhere on the system. Keeping the
+whole chain root-owned leaves no component for anything to swap.
+
+So the helper accepts no path from its caller at all. It is given a share
+name, validates it, and derives the mountpoint itself. It opens each
+directory on the way with `O_NOFOLLOW`, refuses one that is a symlink or is
+not owned by root, and keeps the descriptor — so every later step works on
+the directory it checked rather than resolving the name a second time. After
+a mount it re-reads the kernel's mount table to confirm the share landed
+where it was asked to, and unmounts it if it did not. Every tool it runs is
+an absolute path rather than something found on `PATH`, under a deadline,
+with its whole process group torn down if it overruns, so an unreachable NAS
+cannot leave a root process hanging.
 
 ## Encrypted shared folders
 

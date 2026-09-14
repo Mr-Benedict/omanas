@@ -56,7 +56,7 @@
       {
         "key": "mountRoot",
         "type": "string",
-        "label": "Mount shared folders under",
+        "label": "Shortcut to mounted shares (they live under /mnt/omanas)",
         "defaultValue": "~/mnt/nas"
       },
       {

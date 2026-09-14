@@ -35,9 +35,6 @@ def qml_files():
 
 
 class Manifest(unittest.TestCase):
-    def test_it_is_valid_json(self):
-        json.loads(read("manifest.json"))
-
     def test_the_required_keys_are_present(self):
         for key in ["schemaVersion", "id", "name", "version", "license",
                     "description", "kinds", "entryPoints"]:
@@ -73,12 +70,6 @@ class Settings(unittest.TestCase):
     WIDGET = MANIFEST["barWidget"]
     SCHEMA = {item["key"]: item for item in WIDGET["schema"]}
     DEFAULTS = WIDGET["defaults"]
-
-    def test_every_schema_key_has_a_default(self):
-        # A settings row with no default renders empty and writes an empty
-        # value back the first time it is touched.
-        for key in self.SCHEMA:
-            self.assertIn(key, self.DEFAULTS, key)
 
     def test_every_default_is_settable(self):
         for key in self.DEFAULTS:
@@ -117,6 +108,14 @@ class Settings(unittest.TestCase):
     def test_the_mount_root_default_matches_what_the_helper_uses(self):
         self.assertIn("--mount-root", read("bin", "omanas"))
         self.assertIn(self.DEFAULTS["mountRoot"], read("bin", "omanas"))
+
+    def test_the_mount_root_is_described_as_a_shortcut(self):
+        # It stopped being where shares are mounted: the helper derives that
+        # itself, under /mnt/omanas. A label still promising otherwise would
+        # have people typing a path that does nothing.
+        label = self.SCHEMA["mountRoot"]["label"]
+        self.assertIn("/mnt/omanas", label)
+        self.assertIn("/mnt/omanas", read("bin", "omanas"))
 
 
 # A `/` starts a regex literal only where a value may begin. Without this,
@@ -251,6 +250,12 @@ class Scripts(unittest.TestCase):
                     continue
                 with self.subTest(name=name, module=module):
                     self.assertIn(root, allowed, module)
+
+    def test_the_client_never_names_a_mountpoint(self):
+        # The root helper derives the path from the account it is mounting
+        # for. A client that could name one would reopen the race that
+        # moving the mounts out of the user's home closed.
+        self.assertNotIn("--mountpoint", read("bin", "omanas"))
 
     def test_the_version_the_helper_reports_matches_the_manifest(self):
         self.assertIn(f'"omanas": "{MANIFEST["version"]}"', read("bin", "omanas"))

@@ -13,7 +13,8 @@ the mount takes.
 
 import json
 import os
-import stat
+import pwd
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -29,15 +30,15 @@ class Parser(unittest.TestCase):
     PARSER = mod.build_parser()
 
     INVOCATIONS = [
-        ["configure", "--host", "nas.local", "--user", "ben"],
-        ["configure", "--host", "nas.local", "--user", "ben", "--no-https", "--port", "5000"],
-        ["configure", "--host", "nas.local", "--user", "ben", "--accept-new-cert"],
+        ["configure", "--host", "nas.local", "--user", "admin"],
+        ["configure", "--host", "nas.local", "--user", "admin", "--no-https", "--port", "5000"],
+        ["configure", "--host", "nas.local", "--user", "admin", "--accept-new-cert"],
         ["login"],
         ["login", "--otp", "123456", "--force"],
         ["logout"],
-        ["connect", "--host", "nas.local", "--user", "ben"],
-        ["connect", "--host", "nas.local", "--user", "ben", "--otp", "123456"],
-        ["connect", "--host", "nas.local", "--user", "ben", "--no-https", "--accept-new-cert"],
+        ["connect", "--host", "nas.local", "--user", "admin"],
+        ["connect", "--host", "nas.local", "--user", "admin", "--otp", "123456"],
+        ["connect", "--host", "nas.local", "--user", "admin", "--no-https", "--accept-new-cert"],
         ["status"],
         ["status", "--logs", "25"],
         ["utilisation"],
@@ -92,7 +93,7 @@ class Config(unittest.TestCase):
         os.rmdir(directory)
 
     def test_round_trip(self):
-        mod.save_config({"host": "nas.local", "username": "ben", "port": 5001})
+        mod.save_config({"host": "nas.local", "username": "admin", "port": 5001})
         self.assertEqual(mod.load_config()["host"], "nas.local")
 
     def test_a_missing_file_is_not_an_error(self):
@@ -119,18 +120,39 @@ class Config(unittest.TestCase):
         mod.save_config({"host": "other.local"})
         self.assertEqual(os.listdir(mod.CONFIG_DIR), ["config.json"])
 
+    def test_the_scratch_file_is_not_a_predictable_name(self):
+        # It used to be config.json.tmp, which anyone could create first.
+        # Whatever mkstemp picks, nothing is left behind under either name.
+        mod.save_config({"host": "nas.local"})
+        self.assertFalse(os.path.exists(mod.CONFIG_PATH + ".tmp"))
+        self.assertEqual(os.listdir(mod.CONFIG_DIR), ["config.json"])
+
+    def test_a_write_that_fails_leaves_no_scratch_file(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, directory)
+        with self.assertRaises(TypeError):
+            mod.write_private(os.path.join(directory, "config.json"), None)
+        self.assertEqual(os.listdir(directory), [])
+
+    def test_a_written_file_is_private_from_the_first_byte(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = os.path.join(directory, "session.json")
+        mod.write_private(path, "{}")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
 
 class Keyring(unittest.TestCase):
     def test_attributes_identify_one_credential_on_one_nas(self):
-        attrs = mod.secret_attrs({"host": "nas.local", "username": "ben"}, "password")
+        attrs = mod.secret_attrs({"host": "nas.local", "username": "admin"}, "password")
         pairs = dict(zip(attrs[::2], attrs[1::2]))
         self.assertEqual(pairs["service"], "omanas")
         self.assertEqual(pairs["host"], "nas.local")
-        self.assertEqual(pairs["account"], "ben")
+        self.assertEqual(pairs["account"], "admin")
         self.assertEqual(pairs["kind"], "password")
 
     def test_the_password_and_the_device_token_are_separate_entries(self):
-        config = {"host": "nas.local", "username": "ben"}
+        config = {"host": "nas.local", "username": "admin"}
         self.assertNotEqual(mod.secret_attrs(config, "password"),
                             mod.secret_attrs(config, "device_id"))
 
@@ -142,22 +164,102 @@ class Keyring(unittest.TestCase):
 
 
 class MountTargets(unittest.TestCase):
-    def test_a_share_lands_under_the_mount_root(self):
-        self.assertEqual(mod.mount_target({}, "/home/me/nas", "Photos"),
-                         "/home/me/nas/Photos")
+    """The mountpoint is derived, on this side and in the root helper.
 
-    def test_a_tilde_is_expanded(self):
-        target = mod.mount_target({}, "~/mnt/nas", "Photos")
-        self.assertTrue(target.startswith(os.path.expanduser("~")))
-        self.assertTrue(target.endswith("/mnt/nas/Photos"))
+    Nobody names it: the path is a chain of root-owned directories, which is
+    what stops anything on it being swapped for a symlink between the helper
+    checking the directory and mounting on it.
+    """
 
-    def test_an_empty_root_falls_back_to_the_documented_default(self):
-        self.assertEqual(mod.mount_target({}, "", "Photos"),
-                         os.path.expanduser("~/mnt/nas/Photos"))
+    USER = pwd.getpwuid(os.getuid()).pw_name
+
+    def test_a_share_lands_under_the_root_owned_base(self):
+        self.assertEqual(mod.mount_target("Photos"),
+                         f"/mnt/omanas/{self.USER}/Photos")
+
+    def test_the_base_is_not_under_the_user_s_home(self):
+        # A mountpoint the user can rename is a mountpoint the user can
+        # replace between the check and the mount.
+        self.assertFalse(mod.mount_target("Photos").startswith(
+            os.path.expanduser("~") + os.sep))
 
     def test_a_share_with_a_space_is_not_mangled(self):
-        self.assertEqual(mod.mount_target({}, "/mnt", "Time Machine"),
-                         "/mnt/Time Machine")
+        self.assertEqual(mod.mount_target("Time Machine"),
+                         f"/mnt/omanas/{self.USER}/Time Machine")
+
+
+class Tools(unittest.TestCase):
+    """Every program this helper runs is named by absolute path."""
+
+    def test_an_installed_tool_resolves_to_an_absolute_path(self):
+        found = mod.tool("sh")
+        self.assertIsNotNone(found)
+        self.assertTrue(os.path.isabs(found))
+        self.assertIn(os.path.dirname(found), mod.TOOL_DIRS)
+        self.assertTrue(os.access(found, os.X_OK))
+
+    def test_a_missing_tool_is_none_rather_than_a_bare_name(self):
+        # A bare name would be handed to subprocess, which would resolve it
+        # through PATH -- the thing this exists to avoid.
+        self.assertIsNone(mod.tool("omanas-no-such-tool"))
+
+    def test_path_is_never_consulted(self):
+        # PATH belongs to whoever started the panel. A 'pkexec' planted
+        # earlier on it would be handed the NAS password on stdin.
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        planted = os.path.join(directory, "omanas-no-such-tool")
+        with open(planted, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        os.chmod(planted, 0o755)
+
+        previous = os.environ.get("PATH", "")
+        self.addCleanup(os.environ.__setitem__, "PATH", previous)
+        os.environ["PATH"] = directory + os.pathsep + previous
+        self.assertIsNone(mod.tool("omanas-no-such-tool"))
+
+
+class ShortcutToTheMountRoot(unittest.TestCase):
+    """mountRoot stopped being where shares live and became a link to it."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home)
+        self.real = os.path.join(mod.MOUNT_BASE, pwd.getpwuid(os.getuid()).pw_name)
+
+    def test_a_free_path_gets_a_link_to_the_real_root(self):
+        target = os.path.join(self.home, "mnt", "nas")
+        mod.link_mount_root(target)
+        self.assertTrue(os.path.islink(target))
+        self.assertEqual(os.readlink(target), self.real)
+
+    def test_an_existing_directory_is_left_exactly_alone(self):
+        # Someone may already keep things in ~/mnt/nas. Replacing it with a
+        # link would hide them.
+        target = os.path.join(self.home, "mnt", "nas")
+        os.makedirs(target)
+        with open(os.path.join(target, "notes.txt"), "w", encoding="utf-8") as handle:
+            handle.write("mine")
+        mod.link_mount_root(target)
+        self.assertFalse(os.path.islink(target))
+        self.assertEqual(os.listdir(target), ["notes.txt"])
+
+    def test_a_link_pointing_somewhere_else_is_not_repointed(self):
+        target = os.path.join(self.home, "nas")
+        os.symlink("/var/empty", target)
+        mod.link_mount_root(target)
+        self.assertEqual(os.readlink(target), "/var/empty")
+
+    def test_running_it_twice_changes_nothing(self):
+        target = os.path.join(self.home, "nas")
+        mod.link_mount_root(target)
+        mod.link_mount_root(target)
+        self.assertEqual(os.readlink(target), self.real)
+
+    def test_a_path_that_cannot_be_made_is_not_an_error(self):
+        # A mount that worked must never be reported as failed because a
+        # convenience symlink could not be created.
+        mod.link_mount_root("/proc/omanas/nas")
 
 
 class Privileged(unittest.TestCase):
@@ -169,6 +271,10 @@ class Privileged(unittest.TestCase):
         self.addCleanup(setattr, mod.subprocess, "run", mod.subprocess.run)
         mod.subprocess.run = self._run
         self.addCleanup(setattr, mod, "MOUNT_HELPER", mod.MOUNT_HELPER)
+        # pkexec is resolved rather than looked up on PATH, and a machine
+        # without it would otherwise never reach subprocess at all.
+        self.addCleanup(setattr, mod, "tool", mod.tool)
+        mod.tool = lambda name: "/usr/bin/" + name
 
     def _run(self, argv, **kwargs):
         self.calls.append({"argv": argv, **kwargs})
@@ -184,19 +290,39 @@ class Privileged(unittest.TestCase):
 
     def test_it_goes_through_pkexec_rather_than_running_as_root_directly(self):
         mod.run_privileged(["unmount"], None)
-        self.assertEqual(self.calls[0]["argv"][0], "pkexec")
+        self.assertEqual(self.calls[0]["argv"][0], "/usr/bin/pkexec")
         self.assertEqual(self.calls[0]["argv"][1], mod.MOUNT_HELPER)
+
+    def test_pkexec_is_named_by_absolute_path(self):
+        mod.run_privileged(["unmount"], None)
+        self.assertTrue(os.path.isabs(self.calls[0]["argv"][0]))
+
+    def test_the_call_carries_a_deadline(self):
+        # Nothing can cancel a helper the panel is already waiting on.
+        mod.run_privileged(["unmount"], None)
+        self.assertGreater(self.calls[0]["timeout"], 0)
+
+    def test_a_helper_that_never_answers_becomes_an_error_not_a_hang(self):
+        def hanging(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        mod.subprocess.run = hanging
+        answer = mod.run_privileged(["mount"], "p")
+        self.assertFalse(answer["ok"])
+        self.assertTrue(answer["error"])
+
+    def test_a_flood_of_stderr_is_truncated_before_it_is_reported(self):
+        # The panel renders result.error in a label; a megabyte of kernel
+        # noise there is neither readable nor free.
+        self.result = subprocess.CompletedProcess([], 32, "", "x" * 1000000)
+        self.assertLessEqual(len(mod.run_privileged(["mount"], "p")["error"]),
+                             mod.MAX_OUTPUT_CHARS + 1)
 
     def test_a_call_with_no_password_sends_an_empty_stdin(self):
         # unmount and forget need no credential; the helper still reads a
         # line, so it must get one rather than block.
         mod.run_privileged(["unmount"], None)
         self.assertEqual(self.calls[0]["input"], "")
-
-    def test_the_helper_s_json_is_passed_straight_through(self):
-        self.result = subprocess.CompletedProcess([], 0, '{"ok": true, "mountpoint": "/m"}', "")
-        self.assertEqual(mod.run_privileged(["mount"], "p"),
-                         {"ok": True, "mountpoint": "/m"})
 
     def test_only_the_last_line_is_read(self):
         # mount.cifs writes warnings to stdout; the helper's answer is last.
@@ -240,6 +366,79 @@ class Privileged(unittest.TestCase):
             raise FileNotFoundError("pkexec")
         mod.subprocess.run = missing
         self.assertIn("pkexec", mod.run_privileged(["mount"], "p")["error"])
+
+    def test_an_unresolvable_pkexec_is_reported_before_anything_is_run(self):
+        mod.tool = lambda name: None
+        answer = mod.run_privileged(["mount"], "p")
+        self.assertIn("pkexec", answer["error"])
+        self.assertEqual(self.calls, [])
+
+
+class BoundedResponses(unittest.TestCase):
+    """The NAS is trusted to be the NAS, not to be well behaved."""
+
+    class Endless:
+        """Answers with exactly as much as it is asked for, forever."""
+
+        status = 200
+
+        def read(self, limit):
+            return b"x" * limit
+
+    class Sized:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload.encode("utf-8")
+
+        def read(self, limit):
+            return self.payload[:limit]
+
+    class Connection:
+        def __init__(self, response):
+            self.response = response
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return self.response
+
+        def close(self):
+            pass
+
+    def dsm(self, response):
+        client = mod.Dsm({"host": "nas.local", "username": "admin", "port": 5001})
+        client._conn = self.Connection(response)
+        return client
+
+    def test_an_oversized_body_is_refused_rather_than_swallowed(self):
+        # Reading whatever arrives lets whatever is on that port decide how
+        # much memory this process allocates.
+        with self.assertRaises(mod.DsmError) as caught:
+            self.dsm(self.Endless())._request("query.cgi")
+        self.assertIn("MiB", str(caught.exception))
+
+    def test_the_read_is_asked_for_one_byte_past_the_limit(self):
+        # Asking for exactly the limit would make a body of exactly that size
+        # indistinguishable from the first slice of a larger one, so an
+        # oversized answer would be silently truncated instead of refused.
+        # The extra byte is the whole of how "too big" is detected.
+        asked = []
+
+        class Recording(self.Sized):
+            def read(self, limit):
+                asked.append(limit)
+                return super().read(limit)
+
+        body = json.dumps({"success": True, "data": {}})
+        self.dsm(Recording(body))._request("query.cgi")
+        self.assertEqual(asked, [mod.MAX_RESPONSE_BYTES + 1])
+
+    def test_an_ordinary_answer_still_arrives_whole(self):
+        body = json.dumps({"success": True, "data": {"model": "DS923+"}})
+        self.assertEqual(self.dsm(self.Sized(body))._request("query.cgi"),
+                         json.loads(body))
 
 
 class Capabilities(unittest.TestCase):
@@ -368,13 +567,6 @@ class FakeParser:
 
 
 class Executable(unittest.TestCase):
-    def test_the_helper_can_be_run_by_the_panel(self):
-        # The panel runs bin/omanas directly, not through an interpreter.
-        info = os.stat(HELPER)
-        self.assertTrue(info.st_mode & stat.S_IXUSR)
-        with open(HELPER, encoding="utf-8") as handle:
-            self.assertTrue(handle.readline().startswith("#!"))
-
     def test_help_works_without_any_configuration(self):
         result = subprocess.run([HELPER, "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
