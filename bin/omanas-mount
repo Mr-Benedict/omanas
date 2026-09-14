@@ -12,11 +12,13 @@ process running as the calling user could otherwise steer root:
     derives /mnt/omanas/<user>/<share> from it. A path the caller chooses is
     a path the caller can replace with a symlink to /etc between the moment
     it is checked and the moment root uses it.
-  * Every component of that path -- and of /etc/omanas and /run/omanas -- is
-    opened one at a time with O_NOFOLLOW and required to be owned by the
-    identity we run as and writable by nobody else. What is used afterwards
-    is the descriptor, not the name, so there is no second resolution left
-    for anything to race.
+  * Every directory that path is walked through -- and every component of
+    /etc/omanas and /run/omanas -- is opened one at a time with O_NOFOLLOW and
+    required to be owned by the identity we run as and writable by nobody
+    else. That is what makes the last name unswappable, so the mount point
+    itself is only required to be a directory and not a symlink; see
+    mountpoint_for. What is used afterwards is the descriptor, not the name,
+    so there is no second resolution left for anything to race.
   * The SMB password arrives on stdin and reaches mount.cifs through a 0600
     credentials file. It never becomes an argv element, which /proc would
     expose to every user on this machine. The throwaway copy for a one-off
@@ -268,8 +270,16 @@ def describe(parent_fd: int, name: str) -> str:
     return "a symbolic link" if stat.S_ISLNK(info.st_mode) else "not a directory"
 
 
-def descend(parent_fd: int, name: str, mode: int | None) -> int:
-    """Open one path component with O_NOFOLLOW, creating it if asked."""
+def descend(parent_fd: int, name: str, mode: int | None,
+            owned: bool = True) -> int:
+    """Open one path component with O_NOFOLLOW, creating it if asked.
+
+    owned=False opens the component without asking who owns it. It is for a
+    leaf whose inode is legitimately not ours; mountpoint_for is the one
+    caller that wants it, and says there why that is safe. Every component of
+    a chain we walk *through* keeps the full check, because that is where the
+    guarantee lives.
+    """
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         fd = os.open(name, flags, dir_fd=parent_fd)
@@ -304,7 +314,8 @@ def descend(parent_fd: int, name: str, mode: int | None) -> int:
             fail(f"Refusing to use {name}: it is {describe(parent_fd, name)}")
         else:
             fail(f"Cannot open {name}: {error.strerror}")
-    require_own_dir(fd, name)
+    if owned:
+        require_own_dir(fd, name)
     return fd
 
 
@@ -350,6 +361,21 @@ class Mountpoint:
         self.fd = -1
         self.parent_fd = -1
 
+    def release(self) -> None:
+        """Let go of the share directory, keeping its parent.
+
+        The descriptor points inside the filesystem mounted there, and an open
+        descriptor is exactly what makes a mount busy -- umount would refuse
+        while we held it. The parent stays open, because that is what remove()
+        needs and it is the directory the guarantee lives in anyway.
+        """
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+
     def remove(self) -> None:
         """Take the empty directory back, by name relative to its own parent."""
         try:
@@ -376,7 +402,24 @@ def mountpoint_for(user: pwd.struct_passwd, share: str) -> Mountpoint:
     finally:
         os.close(base_fd)
     try:
-        share_fd = descend(user_fd, share, 0o755)
+        # The share directory is the one component whose owner is not asked
+        # about, and the invariant it would have stated is stated by its
+        # parent instead. /mnt/omanas and /mnt/omanas/<user> are ours and
+        # writable by nobody else, so no unprivileged process can rename the
+        # entry <share>, replace it with a symlink, or mount anything over it:
+        # changing what that name means needs write access to a directory the
+        # caller does not have. The leaf is then opened from that verified
+        # descriptor with O_NOFOLLOW|O_DIRECTORY, so a symlink or a plain file
+        # left in its place is still refused here, and what is used afterwards
+        # is the descriptor rather than the name.
+        #
+        # Asking who owns the leaf adds nothing to that, and once the share is
+        # mounted it asks something whose answer is deliberately "the caller":
+        # mount_options passes uid=<caller> so the mounted files are usable by
+        # the person who asked for them, which makes the root inode of the
+        # mounted filesystem theirs. Requiring root here refused every unmount
+        # of a share that was actually mounted.
+        share_fd = descend(user_fd, share, 0o755, owned=False)
     except BaseException:
         os.close(user_fd)
         raise
@@ -853,6 +896,11 @@ def cmd_unmount(args) -> int:
     try:
         if not mounted_at(point.path):
             fail("Not mounted")
+        # Everything the descriptor was for has happened: the chain it was
+        # opened through is what proves this name cannot have been pointed
+        # somewhere else, and that proof does not expire when the descriptor
+        # closes. Holding it any longer would only make the mount busy.
+        point.release()
         result = run_tool([tool("umount"), point.path], UMOUNT_TIMEOUT)
         if result.timed_out:
             fail(f"umount did not finish within {int(UMOUNT_TIMEOUT)} seconds")
