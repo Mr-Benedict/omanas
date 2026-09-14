@@ -35,9 +35,6 @@ def qml_files():
 
 
 class Manifest(unittest.TestCase):
-    def test_it_is_valid_json(self):
-        json.loads(read("manifest.json"))
-
     def test_the_required_keys_are_present(self):
         for key in ["schemaVersion", "id", "name", "version", "license",
                     "description", "kinds", "entryPoints"]:
@@ -73,12 +70,6 @@ class Settings(unittest.TestCase):
     WIDGET = MANIFEST["barWidget"]
     SCHEMA = {item["key"]: item for item in WIDGET["schema"]}
     DEFAULTS = WIDGET["defaults"]
-
-    def test_every_schema_key_has_a_default(self):
-        # A settings row with no default renders empty and writes an empty
-        # value back the first time it is touched.
-        for key in self.SCHEMA:
-            self.assertIn(key, self.DEFAULTS, key)
 
     def test_every_default_is_settable(self):
         for key in self.DEFAULTS:

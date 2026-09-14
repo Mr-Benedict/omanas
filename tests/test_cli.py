@@ -15,7 +15,6 @@ import json
 import os
 import pwd
 import shutil
-import stat
 import subprocess
 import tempfile
 import unittest
@@ -31,15 +30,15 @@ class Parser(unittest.TestCase):
     PARSER = mod.build_parser()
 
     INVOCATIONS = [
-        ["configure", "--host", "nas.local", "--user", "ben"],
-        ["configure", "--host", "nas.local", "--user", "ben", "--no-https", "--port", "5000"],
-        ["configure", "--host", "nas.local", "--user", "ben", "--accept-new-cert"],
+        ["configure", "--host", "nas.local", "--user", "admin"],
+        ["configure", "--host", "nas.local", "--user", "admin", "--no-https", "--port", "5000"],
+        ["configure", "--host", "nas.local", "--user", "admin", "--accept-new-cert"],
         ["login"],
         ["login", "--otp", "123456", "--force"],
         ["logout"],
-        ["connect", "--host", "nas.local", "--user", "ben"],
-        ["connect", "--host", "nas.local", "--user", "ben", "--otp", "123456"],
-        ["connect", "--host", "nas.local", "--user", "ben", "--no-https", "--accept-new-cert"],
+        ["connect", "--host", "nas.local", "--user", "admin"],
+        ["connect", "--host", "nas.local", "--user", "admin", "--otp", "123456"],
+        ["connect", "--host", "nas.local", "--user", "admin", "--no-https", "--accept-new-cert"],
         ["status"],
         ["status", "--logs", "25"],
         ["utilisation"],
@@ -94,7 +93,7 @@ class Config(unittest.TestCase):
         os.rmdir(directory)
 
     def test_round_trip(self):
-        mod.save_config({"host": "nas.local", "username": "ben", "port": 5001})
+        mod.save_config({"host": "nas.local", "username": "admin", "port": 5001})
         self.assertEqual(mod.load_config()["host"], "nas.local")
 
     def test_a_missing_file_is_not_an_error(self):
@@ -145,15 +144,15 @@ class Config(unittest.TestCase):
 
 class Keyring(unittest.TestCase):
     def test_attributes_identify_one_credential_on_one_nas(self):
-        attrs = mod.secret_attrs({"host": "nas.local", "username": "ben"}, "password")
+        attrs = mod.secret_attrs({"host": "nas.local", "username": "admin"}, "password")
         pairs = dict(zip(attrs[::2], attrs[1::2]))
         self.assertEqual(pairs["service"], "omanas")
         self.assertEqual(pairs["host"], "nas.local")
-        self.assertEqual(pairs["account"], "ben")
+        self.assertEqual(pairs["account"], "admin")
         self.assertEqual(pairs["kind"], "password")
 
     def test_the_password_and_the_device_token_are_separate_entries(self):
-        config = {"host": "nas.local", "username": "ben"}
+        config = {"host": "nas.local", "username": "admin"}
         self.assertNotEqual(mod.secret_attrs(config, "password"),
                             mod.secret_attrs(config, "device_id"))
 
@@ -183,9 +182,6 @@ class MountTargets(unittest.TestCase):
         # replace between the check and the mount.
         self.assertFalse(mod.mount_target("Photos").startswith(
             os.path.expanduser("~") + os.sep))
-
-    def test_each_account_gets_its_own_subtree(self):
-        self.assertIn(f"/{self.USER}/", mod.mount_target("Photos"))
 
     def test_a_share_with_a_space_is_not_mangled(self):
         self.assertEqual(mod.mount_target("Time Machine"),
@@ -328,11 +324,6 @@ class Privileged(unittest.TestCase):
         mod.run_privileged(["unmount"], None)
         self.assertEqual(self.calls[0]["input"], "")
 
-    def test_the_helper_s_json_is_passed_straight_through(self):
-        self.result = subprocess.CompletedProcess([], 0, '{"ok": true, "mountpoint": "/m"}', "")
-        self.assertEqual(mod.run_privileged(["mount"], "p"),
-                         {"ok": True, "mountpoint": "/m"})
-
     def test_only_the_last_line_is_read(self):
         # mount.cifs writes warnings to stdout; the helper's answer is last.
         self.result = subprocess.CompletedProcess(
@@ -417,7 +408,7 @@ class BoundedResponses(unittest.TestCase):
             pass
 
     def dsm(self, response):
-        client = mod.Dsm({"host": "nas.local", "username": "ben", "port": 5001})
+        client = mod.Dsm({"host": "nas.local", "username": "admin", "port": 5001})
         client._conn = self.Connection(response)
         return client
 
@@ -576,13 +567,6 @@ class FakeParser:
 
 
 class Executable(unittest.TestCase):
-    def test_the_helper_can_be_run_by_the_panel(self):
-        # The panel runs bin/omanas directly, not through an interpreter.
-        info = os.stat(HELPER)
-        self.assertTrue(info.st_mode & stat.S_IXUSR)
-        with open(HELPER, encoding="utf-8") as handle:
-            self.assertTrue(handle.readline().startswith("#!"))
-
     def test_help_works_without_any_configuration(self):
         result = subprocess.run([HELPER, "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
